@@ -142,7 +142,8 @@ impl<'a> Lowerer<'a> {
         let mut last = Operand::Const(Const::Unit);
         for (i, s) in b.stmts.iter().enumerate() {
             match s {
-                Stmt::Let { name, init, .. } => {
+                Stmt::Let { pat, init, .. } => {
+                    let PatKind::Bind(name) = &pat.kind else { unreachable!("checker rejects other let patterns") };
                     let v = self.expr(init)?;
                     let id = self.new_local(name, self.ty(init));
                     self.push(Statement::Assign(id, Rvalue::Use(v)));
@@ -280,6 +281,7 @@ impl<'a> Lowerer<'a> {
                 self.cur = self.new_block();
                 Operand::Const(Const::Unit)
             }
+            _ => unreachable!("checker rejects unsupported expressions"),
         })
     }
 }

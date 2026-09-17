@@ -5,11 +5,20 @@ pub enum Tok {
     Int(i64),
     Float(f64),
     Str(String),
+    /// A string containing `#{...}`. Code parts are lexed and parsed by the parser.
+    Interp(Vec<RawPart>),
     Ident(String),
     Kw(&'static str),
     Op(&'static str),
     Newline,
     Eof,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum RawPart {
+    Lit(String),
+    /// Source text of the code and the byte offset of its first character.
+    Code(String, u32),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -21,7 +30,7 @@ pub struct Token {
 const KEYWORDS: &[&str] = &[
     "def", "end", "let", "mut", "if", "elsif", "else", "while", "for", "in", "loop", "break",
     "next", "return", "case", "then", "struct", "enum", "trait", "impl", "import", "move", "mdo",
-    "self", "true", "false", "and", "or", "not", "type", "extern",
+    "self", "true", "false", "and", "or", "not", "type", "extern", "Self",
 ];
 
 // Longest operators first so that `..` wins over `.` and `|>` over `|`.
@@ -33,6 +42,87 @@ const OPS: &[&str] = &[
 
 fn sp(s: usize, e: usize) -> Span {
     Span { start: s as u32, end: e as u32 }
+}
+
+/// Lexes a string literal starting at the opening quote. Returns the token and the index after
+/// the closing quote. `#{...}` parts are captured as raw code with their byte offset.
+fn lex_string(src: &str, start: usize) -> Result<(Tok, usize), Diagnostic> {
+    let b = src.as_bytes();
+    let mut i = start + 1;
+    let mut parts: Vec<RawPart> = Vec::new();
+    let mut s = String::new();
+    loop {
+        if i >= b.len() {
+            return Err(Diagnostic::new(sp(start, i), "unterminated string"));
+        }
+        match b[i] {
+            b'"' => {
+                i += 1;
+                break;
+            }
+            b'\\' => {
+                let e = *b.get(i + 1).ok_or_else(|| Diagnostic::new(sp(start, i), "unterminated string"))?;
+                s.push(match e {
+                    b'n' => '\n',
+                    b't' => '\t',
+                    b'\\' => '\\',
+                    b'"' => '"',
+                    b'0' => '\0',
+                    b'#' => '#',
+                    _ => return Err(Diagnostic::new(sp(i, i + 2), "unknown escape")),
+                });
+                i += 2;
+            }
+            b'#' if i + 1 < b.len() && b[i + 1] == b'{' => {
+                if !s.is_empty() {
+                    parts.push(RawPart::Lit(std::mem::take(&mut s)));
+                }
+                let code_start = i + 2;
+                let code_end = skip_code(src, code_start, start)?;
+                parts.push(RawPart::Code(src[code_start..code_end].to_string(), code_start as u32));
+                i = code_end + 1;
+            }
+            _ => {
+                let ch = src[i..].chars().next().unwrap();
+                s.push(ch);
+                i += ch.len_utf8();
+            }
+        }
+    }
+    if parts.is_empty() {
+        return Ok((Tok::Str(s), i));
+    }
+    if !s.is_empty() {
+        parts.push(RawPart::Lit(s));
+    }
+    Ok((Tok::Interp(parts), i))
+}
+
+/// Given the index just after `#{`, returns the index of the matching `}`. Nested braces and
+/// nested string literals (which may themselves interpolate) are skipped.
+fn skip_code(src: &str, from: usize, str_start: usize) -> Result<usize, Diagnostic> {
+    let b = src.as_bytes();
+    let mut depth = 1usize;
+    let mut i = from;
+    while i < b.len() {
+        match b[i] {
+            b'{' => depth += 1,
+            b'}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Ok(i);
+                }
+            }
+            b'"' => {
+                let (_, end) = lex_string(src, i)?;
+                i = end;
+                continue;
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    Err(Diagnostic::new(sp(str_start, i), "unterminated interpolation in string"))
 }
 
 pub fn lex(src: &str) -> Result<Vec<Token>, Diagnostic> {
@@ -96,37 +186,9 @@ pub fn lex(src: &str) -> Result<Vec<Token>, Diagnostic> {
             }
             b'"' => {
                 let start = i;
-                i += 1;
-                let mut s = String::new();
-                loop {
-                    if i >= b.len() {
-                        return Err(Diagnostic::new(sp(start, i), "unterminated string"));
-                    }
-                    match b[i] {
-                        b'"' => {
-                            i += 1;
-                            break;
-                        }
-                        b'\\' => {
-                            let e = *b.get(i + 1).ok_or_else(|| Diagnostic::new(sp(start, i), "unterminated string"))?;
-                            s.push(match e {
-                                b'n' => '\n',
-                                b't' => '\t',
-                                b'\\' => '\\',
-                                b'"' => '"',
-                                b'0' => '\0',
-                                _ => return Err(Diagnostic::new(sp(i, i + 2), "unknown escape")),
-                            });
-                            i += 2;
-                        }
-                        _ => {
-                            let ch = src[i..].chars().next().unwrap();
-                            s.push(ch);
-                            i += ch.len_utf8();
-                        }
-                    }
-                }
-                out.push(Token { tok: Tok::Str(s), span: sp(start, i) });
+                let (tok, end) = lex_string(src, start)?;
+                i = end;
+                out.push(Token { tok, span: sp(start, i) });
             }
             c if c.is_ascii_alphabetic() || c == b'_' => {
                 let start = i;
@@ -226,5 +288,32 @@ mod tests {
     #[test]
     fn unknown_char_errors() {
         assert_eq!(lex("a $ b").unwrap_err().msg, "unexpected character '$'");
+    }
+
+    #[test]
+    fn interpolation_parts_with_offsets() {
+        assert_eq!(
+            toks("\"a #{x + 1} b #{\"in #{y}\"}\""),
+            vec![
+                Tok::Interp(vec![
+                    RawPart::Lit("a ".into()),
+                    RawPart::Code("x + 1".into(), 5),
+                    RawPart::Lit(" b ".into()),
+                    RawPart::Code("\"in #{y}\"".into(), 16),
+                ]),
+                Tok::Newline,
+                Tok::Eof
+            ]
+        );
+    }
+
+    #[test]
+    fn escaped_hash_is_literal() {
+        assert_eq!(toks("\"\\#{x}\""), vec![Tok::Str("#{x}".into()), Tok::Newline, Tok::Eof]);
+    }
+
+    #[test]
+    fn self_type_is_keyword() {
+        assert_eq!(toks("Self self"), vec![Tok::Kw("Self"), Tok::Kw("self"), Tok::Newline, Tok::Eof]);
     }
 }

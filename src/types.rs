@@ -160,7 +160,12 @@ fn last_span(b: &Block, fallback: Span) -> Span {
 
 impl Checker {
     fn from_ast(&self, t: &TypeExpr) -> Result<Type, Diagnostic> {
-        let TypeExpr::Name(name, args, span) = t;
+        let (name, args, span) = match t {
+            TypeExpr::Name(n, a, s) => (n, a, s),
+            TypeExpr::Ref(_, inner, _) => return self.from_ast(inner),
+            TypeExpr::Tuple(items, _) if items.is_empty() => return Ok(Type::unit()),
+            other => return Err(Diagnostic::new(other.span(), "this type is not supported in this version")),
+        };
         let name = match name.as_str() {
             "i64" => "Int",
             "f64" => "Float",
@@ -194,8 +199,11 @@ impl Checker {
         let mut last = Type::unit();
         for (i, s) in b.stmts.iter().enumerate() {
             match s {
-                Stmt::Let { name, mutable, init, .. } => {
+                Stmt::Let { pat, mutable, init, .. } => {
                     let t = self.expr(init)?;
+                    let PatKind::Bind(name) = &pat.kind else {
+                        return Err(Diagnostic::new(pat.span, "this pattern is not supported in this version"));
+                    };
                     self.scopes.last_mut().unwrap().insert(name.clone(), (t, *mutable));
                     last = Type::unit();
                 }
@@ -336,6 +344,7 @@ impl Checker {
                 self.inf.unify(&ret, &vt, span)?;
                 self.inf.fresh()
             }
+            _ => return Err(Diagnostic::new(e.span, "this expression is not supported in this version")),
         };
         Ok(self.record(e, t))
     }
@@ -353,6 +362,7 @@ pub fn check(prog: &Program) -> Result<TypeInfo, Diagnostic> {
         let (d, is_extern) = match item {
             Item::Def(d) => (d, false),
             Item::Extern(d) => (d, true),
+            _ => continue,
         };
         let mut params = Vec::new();
         for p in &d.params {
@@ -391,6 +401,7 @@ pub fn check(prog: &Program) -> Result<TypeInfo, Diagnostic> {
     for item in &prog.items {
         let d = match item {
             Item::Def(d) | Item::Extern(d) => d,
+            _ => continue,
         };
         let mut g = cx.globals[&d.name].clone();
         g.ty = cx.inf.resolve(&g.ty);

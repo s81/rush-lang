@@ -93,6 +93,7 @@ end
 - `enum Name` with `Variant`, `Variant(T1, T2)`, or `Variant { f: T }` lines.
 - `trait Name` with `def` signatures and optional default bodies. `trait Name: Super` for supertraits. `type Item` for associated types.
 - `impl Trait for Type` and `impl Type` for inherent methods. `impl[T: Bound] Trait for Type[T]` for generic instances.
+- A `derive Show, Eq, Copy` line inside a `struct` or `enum` body generates those instances (decided 2026-09-17; implemented from Plan 3 on).
 - `import name` loads `name.rush` from the same directory. Everything top-level in a file is exported. One file is one module.
 - `extern "C" def name(p: T) -> R` declares a runtime primitive.
 
