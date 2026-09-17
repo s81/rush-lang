@@ -1,0 +1,1 @@
+error: non-exhaustive `case`: pattern `Rect(_, _)` not covered

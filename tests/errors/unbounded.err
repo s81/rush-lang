@@ -1,0 +1,1 @@
+error: `T` is not bounded by `Show`; add `T: Show`

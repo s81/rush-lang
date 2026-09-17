@@ -1,0 +1,19 @@
+def unwrap_or[T](o: Option[T], default: T) -> T
+  case o
+  in Some(v) then v
+  in None then default
+  end
+end
+
+def none_int() -> Option[Int]
+  None
+end
+
+def main
+  puts("#{Some(3)} #{none_int}")
+  puts(int_to_s(unwrap_or(Some(3), 0)))
+  puts(unwrap_or(None, "fallback"))
+  puts(bool_to_s(Some(1) == Some(1)))
+  puts(bool_to_s(Some("a") == None))
+  puts("#{Some(Some(true))}")
+end

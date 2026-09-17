@@ -1,0 +1,8 @@
+enum Tree
+  Leaf
+  Node(Tree, Tree)
+end
+
+def main
+  ()
+end

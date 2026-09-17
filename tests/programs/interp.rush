@@ -1,0 +1,22 @@
+struct Point
+  x: Float
+  y: Float
+end
+
+impl Show for Point
+  def to_s(&self)
+    "(#{@x}, #{@y})"
+  end
+end
+
+impl Point
+  def swap(&self) -> Point
+    Point { x: self.y, y: self.x }
+  end
+end
+
+def main
+  let p = Point { x: 1.0, y: 2.0 }
+  puts("#{p} swapped is #{p.swap} and #{1 + 2} is #{true}")
+  puts("nested #{"inner #{p.x}"}")
+end

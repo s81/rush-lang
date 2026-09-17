@@ -1,0 +1,28 @@
+enum Shape
+  Circle(Float)
+  Rect(Float, Float)
+  Empty
+end
+
+trait Area
+  def area(&self) -> Float
+  def describe(&self) -> String
+    "area #{self.area}"
+  end
+end
+
+impl Area for Shape
+  def area(&self)
+    case self
+    in Circle(r) then 3.0 * r * r
+    in Rect(w, h) then w * h
+    in Empty then 0.0
+    end
+  end
+end
+
+def main
+  puts(Circle(1.0).describe)
+  puts(Rect(2.0, 3.0).describe)
+  puts(Empty.describe)
+end

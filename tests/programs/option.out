@@ -1,0 +1,6 @@
+Some(3) None
+3
+fallback
+true
+false
+Some(Some(true))

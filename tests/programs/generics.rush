@@ -1,0 +1,22 @@
+struct Pair[A, B]
+  first: A
+  second: B
+end
+
+impl[A: Show, B: Show] Show for Pair[A, B]
+  def to_s(&self)
+    "<#{@first}, #{@second}>"
+  end
+end
+
+def flip[A, B](p: Pair[A, B]) -> Pair[B, A]
+  Pair { first: p.second, second: p.first }
+end
+
+def main
+  let p = Pair { first: 1, second: "x" }
+  puts("#{p} #{flip(p)} #{flip(flip(p))}")
+  let mut q = Pair { first: true, second: 2.5 }
+  q.first = false
+  puts("#{q}")
+end

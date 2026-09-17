@@ -3,6 +3,43 @@
 A compiled language: Go-style single binaries, Haskell-style types, Rust-style ownership, Ruby-style syntax.
 Design: `docs/superpowers/specs/2026-09-17-rush-stage1-design.md`.
 
+## Taste
+
+```ruby
+enum Shape
+  Circle(Float)
+  Rect(Float, Float)
+end
+
+trait Area
+  def area(&self) -> Float
+  def describe(&self) -> String
+    "area #{self.area}"
+  end
+end
+
+impl Area for Shape
+  def area(&self)
+    case self
+    in Circle(r) then 3.14159 * r * r
+    in Rect(w, h) then w * h
+    end
+  end
+end
+
+def unwrap_or[T](o: Option[T], default: T) -> T
+  case o
+  in Some(v) then v
+  in None then default
+  end
+end
+
+def main
+  puts(Rect(2.0, 3.0).describe)
+  puts("#{unwrap_or(Some(3), 0)} #{Some("x")}")
+end
+```
+
 ## Build
 
     export PATH="$HOME/.cargo/bin:$PATH"   # Git Bash on Windows
