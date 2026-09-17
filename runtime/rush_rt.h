@@ -24,5 +24,6 @@ rush_unit rush_print(rush_str s);
 rush_str rush_int_to_s(int64_t v);
 rush_str rush_float_to_s(double v);
 rush_str rush_bool_to_s(bool v);
+rush_str rush_str_concat(rush_str a, rush_str b);
 
 #endif

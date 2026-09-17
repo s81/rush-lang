@@ -84,3 +84,15 @@ rush_str rush_float_to_s(double v) {
 rush_str rush_bool_to_s(bool v) {
     return v ? rush_str_lit("true", 4) : rush_str_lit("false", 5);
 }
+
+rush_str rush_str_concat(rush_str a, rush_str b) {
+    size_t len = a.len + b.len;
+    uint8_t *p = (uint8_t *)malloc(len ? len : 1);
+    if (!p) rush_panic("out of memory");
+    memcpy(p, a.ptr, a.len);
+    memcpy(p + a.len, b.ptr, b.len);
+    rush_str r;
+    r.ptr = p;
+    r.len = len;
+    return r;
+}
