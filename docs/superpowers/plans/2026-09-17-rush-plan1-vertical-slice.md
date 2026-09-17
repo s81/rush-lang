@@ -149,7 +149,7 @@ mod tests {
         let d = Diagnostic::new(Span { start: 23, end: 27 }, "type mismatch");
         assert_eq!(
             render("a.rush", src, &d),
-            "a.rush:2:15: error: type mismatch\n    let x = 1 + true\n                ^^^^\n"
+            format!("a.rush:2:15: error: type mismatch\n    let x = 1 + true\n{}^^^^\n", " ".repeat(16))
         );
     }
 }
@@ -1192,7 +1192,7 @@ mod tests {
         let mut types: Vec<String> = info.expr_types.values().map(|t| t.to_string()).collect();
         types.sort();
         types.dedup();
-        assert_eq!(types, vec!["Float", "String", "Unit"]);
+        assert_eq!(types, vec!["Float", "String", "String -> Unit", "Unit"]);
     }
 
     #[test]
@@ -2317,7 +2317,7 @@ mod tests {
         assert!(c.contains("static int64_t rush_fib(int64_t _1);\n"));
         assert!(c.contains("static rush_unit rush_main(void);\n"));
         assert!(c.contains("static int64_t rush_fib(int64_t _1) {\n"));
-        assert!(c.contains("  _2 = (_1 < 2);\n"));
+        assert!(c.contains("  _2 = (_1 < INT64_C(2));\n"));
         assert!(c.contains("  if (_2) goto bb1; else goto bb2;\n"));
         assert!(c.contains("  _5 = rush_fib(_4);\n"));
         assert!(c.contains("  return _0;\n"));
@@ -2408,7 +2408,7 @@ fn operand(o: &Operand) -> String {
     }
 }
 
-fn operand_type<'a>(b: &'a Body, o: &Operand) -> Type {
+fn operand_type(b: &Body, o: &Operand) -> Type {
     match o {
         Operand::Local(id) => b.locals[*id as usize].ty.clone(),
         Operand::Const(Const::Int(_)) => Type::con("Int"),
@@ -2737,7 +2737,8 @@ fn find_cc() -> Option<Vec<String>> {
     if let Ok(cc) = std::env::var("RUSH_CC") {
         return Some(cc.split_whitespace().map(str::to_string).collect());
     }
-    for cand in [&["cc"][..], &["gcc"], &["clang"], &["tcc"], &["zig", "cc"]] {
+    let candidates: [&[&str]; 5] = [&["cc"], &["gcc"], &["clang"], &["tcc"], &["zig", "cc"]];
+    for cand in candidates {
         let ok = Command::new(cand[0])
             .args(&cand[1..])
             .arg("-v")
@@ -2803,6 +2804,9 @@ fn build(args: &[String], run: bool) -> i32 {
     cmd.arg("-o").arg(&exe);
     cmd.arg(build_dir.join(format!("{stem}.c")));
     cmd.arg(build_dir.join("rush_rt.c"));
+    if !cfg!(windows) {
+        cmd.arg("-lm");
+    }
     match cmd.status() {
         Ok(s) if s.success() => {}
         Ok(s) => {
@@ -2866,8 +2870,7 @@ Expected: the ten Fibonacci numbers, and `tests/programs/fib.exe` plus `tests/pr
 Append to `.gitignore`:
 
 ```
-tests/programs/*.exe
-tests/programs/[a-z]*
+tests/programs/*
 !tests/programs/*.rush
 !tests/programs/*.out
 ```
