@@ -60,6 +60,9 @@ static void body(void) {
     rush_str lit = rush_str_lit("abc", 3);
     rush_str owned = rush_str_clone(&lit);
     if (!rush_str_eq(lit, owned) || owned.cap == 0) return;
+    rush_str both = rush_str_concat(&lit, &owned);
+    if (both.len != 6) return;
+    rush_str_drop(&both);
     rush_str_drop(&owned);
     rush_str_drop(&lit);
     if (rush_add_i64_checked(1, 2) != 3 || rush_mul_i64_checked(-3, 4) != -12) return;

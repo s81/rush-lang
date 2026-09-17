@@ -33,13 +33,13 @@ void rush_gc_collect(void);
 int64_t rush_gc_live_objects(void);
 
 /* Primitives declared in std/prelude.rush as extern "C". */
-rush_unit rush_puts(rush_str s);
-rush_unit rush_print(rush_str s);
+rush_unit rush_puts(const rush_str *s);
+rush_unit rush_print(const rush_str *s);
 rush_str rush_int_to_s(int64_t v);
 rush_str rush_float_to_s(double v);
 rush_str rush_bool_to_s(bool v);
-rush_str rush_str_concat(rush_str a, rush_str b);
-rush_unit rush_gc_collect_rt(rush_unit u);
-int64_t rush_gc_live_objects_rt(rush_unit u);
+rush_str rush_str_concat(const rush_str *a, const rush_str *b);
+rush_unit rush_gc_collect_now(void);
+int64_t rush_gc_live(void);
 
 #endif

@@ -70,12 +70,12 @@ bool rush_str_eq(rush_str a, rush_str b) {
     return a.len == b.len && memcmp(a.ptr, b.ptr, a.len) == 0;
 }
 
-rush_str rush_str_concat(rush_str a, rush_str b) {
-    size_t len = a.len + b.len;
+rush_str rush_str_concat(const rush_str *a, const rush_str *b) {
+    size_t len = a->len + b->len;
     uint8_t *p = (uint8_t *)malloc(len ? len : 1);
     if (!p) rush_panic("out of memory");
-    memcpy(p, a.ptr, a.len);
-    memcpy(p + a.len, b.ptr, b.len);
+    memcpy(p, a->ptr, a->len);
+    memcpy(p + a->len, b->ptr, b->len);
     rush_str r;
     r.ptr = p;
     r.len = len;
@@ -124,14 +124,14 @@ int64_t rush_mul_i64_checked(int64_t a, int64_t b) {
 
 /* ---------- IO ---------- */
 
-rush_unit rush_puts(rush_str s) {
-    fwrite(s.ptr, 1, s.len, stdout);
+rush_unit rush_puts(const rush_str *s) {
+    fwrite(s->ptr, 1, s->len, stdout);
     fputc('\n', stdout);
     return RUSH_UNIT;
 }
 
-rush_unit rush_print(rush_str s) {
-    fwrite(s.ptr, 1, s.len, stdout);
+rush_unit rush_print(const rush_str *s) {
+    fwrite(s->ptr, 1, s->len, stdout);
     return RUSH_UNIT;
 }
 
@@ -290,13 +290,11 @@ int64_t rush_gc_live_objects(void) {
     return (int64_t)gc_count;
 }
 
-rush_unit rush_gc_collect_rt(rush_unit u) {
-    (void)u;
+rush_unit rush_gc_collect_now(void) {
     rush_gc_collect();
     return RUSH_UNIT;
 }
 
-int64_t rush_gc_live_objects_rt(rush_unit u) {
-    (void)u;
+int64_t rush_gc_live(void) {
     return rush_gc_live_objects();
 }

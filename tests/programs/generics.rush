@@ -1,4 +1,5 @@
 struct Pair[A, B]
+  derive Clone
   first: A
   second: B
 end
@@ -10,12 +11,13 @@ impl[A: Show, B: Show] Show for Pair[A, B]
 end
 
 def flip[A, B](p: Pair[A, B]) -> Pair[B, A]
-  Pair { first: p.second, second: p.first }
+  let Pair { first: a, second: b } = p
+  Pair { first: b, second: a }
 end
 
 def main
   let p = Pair { first: 1, second: "x" }
-  puts("#{p} #{flip(p)} #{flip(flip(p))}")
+  puts("#{p} #{flip(p.clone)} #{flip(flip(p.clone))}")
   let mut q = Pair { first: true, second: 2.5 }
   q.first = false
   puts("#{q}")

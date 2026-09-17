@@ -20,6 +20,8 @@ fn generic_names(g: &Generics) -> Result<Vec<String>, Diagnostic> {
 /// ADT names contained by value in `t`, including through type arguments.
 fn contained_adts(t: &Type, adts: &HashMap<String, usize>, out: &mut Vec<String>) {
     match t {
+        // References and Gc handles are pointers: no by-value containment.
+        Type::Con(n, _) if n == "&" || n == "&mut" || n == "Gc" => {}
         Type::Con(n, args) => {
             if adts.contains_key(n) && !out.contains(n) {
                 out.push(n.clone());
@@ -27,6 +29,19 @@ fn contained_adts(t: &Type, adts: &HashMap<String, usize>, out: &mut Vec<String>
             args.iter().for_each(|a| contained_adts(a, adts, out));
         }
         _ => {}
+    }
+}
+
+/// Rejects references where Plan 3a cannot track them (fields and return types).
+fn no_refs(t: &Type, span: Span) -> Result<(), Diagnostic> {
+    match t {
+        Type::Con(n, _) if n == "&" || n == "&mut" => Err(Diagnostic::new(span, "references in this position are not supported until Plan 3b")),
+        Type::Con(_, args) => args.iter().try_for_each(|a| no_refs(a, span)),
+        Type::Fn(a, b) => {
+            no_refs(a, span)?;
+            no_refs(b, span)
+        }
+        _ => Ok(()),
     }
 }
 
@@ -45,6 +60,7 @@ impl<'a> Checker<'a> {
     }
 
     pub fn collect_types(&mut self) -> Result<(), Diagnostic> {
+        self.adts.insert("Gc".into(), 1);
         for item in &self.prog.items {
             let (name, generics, span) = match item {
                 Item::Struct(s) => (&s.name, &s.generics, s.span),
@@ -66,7 +82,9 @@ impl<'a> Checker<'a> {
                         if fields.iter().any(|(n, _)| n == &f.name) {
                             return Err(Diagnostic::new(f.span, format!("duplicate field `{}`", f.name)));
                         }
-                        fields.push((f.name.clone(), from_ast(&f.ty, &env)?));
+                        let ft = from_ast(&f.ty, &env)?;
+                        no_refs(&ft, f.span)?;
+                        fields.push((f.name.clone(), ft));
                     }
                     self.info.structs.insert(s.name.clone(), StructInfo { generics, fields, span: s.span });
                 }
@@ -83,7 +101,9 @@ impl<'a> Checker<'a> {
                             VariantFields::Unit => {}
                             VariantFields::Tuple(tys) => {
                                 for t in tys {
-                                    fields.push((None, from_ast(t, &env)?));
+                                    let ft = from_ast(t, &env)?;
+                                    no_refs(&ft, t.span())?;
+                                    fields.push((None, ft));
                                 }
                             }
                             VariantFields::Named(fs) => {
@@ -91,7 +111,9 @@ impl<'a> Checker<'a> {
                                     if fields.iter().any(|(n, _)| n.as_deref() == Some(&f.name)) {
                                         return Err(Diagnostic::new(f.span, format!("duplicate field `{}`", f.name)));
                                     }
-                                    fields.push((Some(f.name.clone()), from_ast(&f.ty, &env)?));
+                                    let ft = from_ast(&f.ty, &env)?;
+                                    no_refs(&ft, f.span)?;
+                                    fields.push((Some(f.name.clone()), ft));
                                 }
                             }
                         }
@@ -152,7 +174,12 @@ impl<'a> Checker<'a> {
         if d.self_param.is_none() {
             return Err(Diagnostic::new(d.span, format!("{where_} method `{}` must take `self`", d.name)));
         }
-        let mut params = vec![self_ty.clone()];
+        let self_arg = match d.self_param.unwrap() {
+            SelfKind::Value => self_ty.clone(),
+            SelfKind::Ref => Type::r#ref(false, self_ty.clone()),
+            SelfKind::RefMut => Type::r#ref(true, self_ty.clone()),
+        };
+        let mut params = vec![self_arg];
         for (i, p) in d.params.iter().enumerate() {
             match (&p.ty, required) {
                 (Some(t), _) => params.push(from_ast(t, &env)?),
@@ -163,10 +190,47 @@ impl<'a> Checker<'a> {
         let ret = match (&d.ret, required) {
             (Some(t), _) => from_ast(t, &env)?,
             (None, Some((_, r))) => r.clone(),
-            (None, None) if where_ == "trait" => Type::unit(),
-            (None, None) => return Err(Diagnostic::new(d.span, format!("{where_} method `{}` needs a return type annotation", d.name))),
+            (None, None) => Type::unit(),
         };
+        no_refs(&ret, d.ret.as_ref().map(|t| t.span()).unwrap_or(d.span))?;
         Ok((params, ret))
+    }
+
+    /// Converts an associated function header (no `self`); everything must be annotated.
+    fn assoc_sig(&self, d: &Def, generics: &[String], self_ty: &Type) -> Result<(Vec<Type>, Type), Diagnostic> {
+        let env = TypeEnv { adts: &self.adts, generics, self_ty: Some(self_ty) };
+        let mut params = Vec::new();
+        for p in &d.params {
+            match &p.ty {
+                Some(t) => params.push(from_ast(t, &env)?),
+                None => return Err(Diagnostic::new(p.span, format!("associated function parameter `{}` must be annotated", p.name))),
+            }
+        }
+        let ret = match &d.ret {
+            Some(t) => from_ast(t, &env)?,
+            None => Type::unit(),
+        };
+        no_refs(&ret, d.ret.as_ref().map(|t| t.span()).unwrap_or(d.span))?;
+        Ok((params, ret))
+    }
+
+    /// Registers the compiler-implemented `Gc` type: `Gc.new`, `g.borrow`, `g.borrow_mut`.
+    fn register_gc(&mut self) {
+        let t = Type::Param("T".into());
+        let gc = Type::Con("Gc".into(), vec![t.clone()]);
+        let mut add = |name: &str, ty: Type| {
+            self.info.globals.insert(name.to_string(), Global { scheme: Scheme { vars: vec!["T".into()], bounds: vec![], ty }, n_params: 1, kind: GlobalKind::Intrinsic });
+        };
+        add("Gc::new", Type::func(&[t.clone()], gc.clone()));
+        add("Gc::borrow", Type::func(&[Type::r#ref(false, gc.clone())], Type::r#ref(false, t.clone())));
+        add("Gc::borrow_mut", Type::func(&[Type::r#ref(false, gc.clone())], Type::r#ref(true, t.clone())));
+        let id = self.info.impls.len();
+        let mut methods = HashMap::new();
+        methods.insert("borrow".to_string(), "Gc::borrow".to_string());
+        methods.insert("borrow_mut".to_string(), "Gc::borrow_mut".to_string());
+        let mut assoc = HashMap::new();
+        assoc.insert("new".to_string(), "Gc::new".to_string());
+        self.info.impls.push(ImplInfo { id, generics: vec!["T".into()], bounds: vec![], trait_name: None, self_ty: gc, methods, assoc, span: Span::default() });
     }
 
     pub fn collect_traits(&mut self) -> Result<(), Diagnostic> {
@@ -211,6 +275,7 @@ impl<'a> Checker<'a> {
     }
 
     pub fn collect_impls(&mut self) -> Result<(), Diagnostic> {
+        self.register_gc();
         for item in &self.prog.items {
             let Item::Impl(imp) = item else { continue };
             let id = self.info.impls.len();
@@ -229,8 +294,9 @@ impl<'a> Checker<'a> {
                 None => self_ty.head().unwrap().to_string(),
             };
             let mut methods = HashMap::new();
+            let mut assoc = HashMap::new();
             for m in &imp.methods {
-                if methods.contains_key(&m.name) {
+                if methods.contains_key(&m.name) || assoc.contains_key(&m.name) {
                     return Err(Diagnostic::new(m.span, format!("duplicate method `{}`", m.name)));
                 }
                 let mgen = generic_names(&m.generics)?;
@@ -238,6 +304,17 @@ impl<'a> Checker<'a> {
                 all_gen.extend(mgen.iter().cloned());
                 let mut all_bounds = bounds.clone();
                 all_bounds.extend(self.check_bounds(&m.generics)?);
+                if m.self_param.is_none() {
+                    if imp.trait_name.is_some() {
+                        return Err(Diagnostic::new(m.span, format!("trait impl method `{}` must take `self`", m.name)));
+                    }
+                    let (params, ret) = self.assoc_sig(m, &all_gen, &self_ty)?;
+                    let global = format!("{prefix}#{id}::{}", m.name);
+                    self.info.globals.insert(global.clone(), Global { scheme: Scheme { vars: all_gen.clone(), bounds: all_bounds.clone(), ty: Type::func(&params, ret) }, n_params: params.len(), kind: GlobalKind::ImplMethod { impl_id: id } });
+                    self.jobs.push(BodyJob { global: global.clone(), def: m, generics: all_gen, bounds: all_bounds, self_ty: Some(self_ty.clone()), generalize: false });
+                    assoc.insert(m.name.clone(), global);
+                    continue;
+                }
                 let (params, ret) = match &imp.trait_name {
                     Some(tn) => {
                         let Some(sig) = self.info.traits[tn].methods.get(&m.name).cloned() else {
@@ -277,7 +354,35 @@ impl<'a> Checker<'a> {
                     return Err(Diagnostic::new(imp.span, format!("missing method `{m}` in impl of `{tn}` for `{self_ty}`")));
                 }
             }
-            self.info.impls.push(ImplInfo { id, generics, bounds, trait_name: imp.trait_name.clone(), self_ty, methods, span: imp.span });
+            self.info.impls.push(ImplInfo { id, generics, bounds, trait_name: imp.trait_name.clone(), self_ty, methods, assoc, span: imp.span });
+        }
+        // `Copy` requires every field to be `Copy` (impl generics bounded by `Copy` count).
+        for imp in self.info.impls.clone() {
+            if imp.trait_name.as_deref() != Some("Copy") {
+                continue;
+            }
+            let Type::Con(head, targs) = &imp.self_ty else { continue };
+            let param_copy = |p: &str| imp.bounds.iter().any(|(gp, tr)| gp == p && tr == "Copy");
+            let fields: Vec<(String, Type)> = if let Some(s) = self.info.structs.get(head) {
+                let map: HashMap<String, Type> = s.generics.iter().cloned().zip(targs.iter().cloned()).collect();
+                s.fields.iter().map(|(n, t)| (n.clone(), subst(t, &map))).collect()
+            } else if let Some(e) = self.info.enums.get(head) {
+                let map: HashMap<String, Type> = e.generics.iter().cloned().zip(targs.iter().cloned()).collect();
+                let mut out = Vec::new();
+                for v in &e.variants {
+                    for (i, (n, t)) in v.fields.iter().enumerate() {
+                        out.push((n.clone().unwrap_or_else(|| format!("{}.{i}", v.name)), subst(t, &map)));
+                    }
+                }
+                out
+            } else {
+                continue;
+            };
+            for (fname, fty) in fields {
+                if !self.info.is_copy(&fty, &param_copy) {
+                    return Err(Diagnostic::new(imp.span, format!("cannot derive `Copy` for `{head}`: field `{fname}` is not `Copy`")));
+                }
+            }
         }
         // Overlap: two impls of one trait whose self types unify (params as fresh vars).
         for i in 0..self.info.impls.len() {
@@ -351,7 +456,11 @@ impl<'a> Checker<'a> {
                 });
             }
             let ret = match &d.ret {
-                Some(t) => from_ast(t, &env)?,
+                Some(t) => {
+                    let r = from_ast(t, &env)?;
+                    no_refs(&r, t.span())?;
+                    r
+                }
                 None if is_extern => Type::unit(),
                 None => {
                     annotated = false;
@@ -420,7 +529,7 @@ mod tests {
 
     #[test]
     fn signature_mismatch_with_trait() {
-        assert_eq!(err(&format!("struct S\n  f: Int\nend\nimpl Show for S\n  def to_s(&self) -> Int\n    1\n  end\nend\n{MAIN}")), "method `to_s` has type `S -> Int`, trait requires `S -> String`");
+        assert_eq!(err(&format!("struct S\n  f: Int\nend\nimpl Show for S\n  def to_s(&self) -> Int\n    1\n  end\nend\n{MAIN}")), "method `to_s` has type `&S -> Int`, trait requires `&S -> String`");
     }
 
     #[test]
@@ -446,7 +555,7 @@ mod tests {
 
     #[test]
     fn inherent_method_needs_annotations() {
-        assert_eq!(err(&format!("struct S\n  f: Int\nend\nimpl S\n  def g(&self)\n    1\n  end\nend\n{MAIN}")), "inherent method `g` needs a return type annotation");
+        assert_eq!(err(&format!("struct S\n  f: Int\nend\nimpl S\n  def g(&self)\n    1\n  end\nend\n{MAIN}")), "type mismatch: expected Unit, found Int");
         assert_eq!(err(&format!("struct S\n  f: Int\nend\nimpl S\n  def g(&self, x) -> Int\n    1\n  end\nend\n{MAIN}")), "inherent method parameter `x` must be annotated");
     }
 

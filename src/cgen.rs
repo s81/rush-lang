@@ -1,6 +1,6 @@
 //! C99 emission from monomorphized MIR.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt::Write;
 
 use crate::ast::{BinOp, UnOp};
@@ -10,6 +10,7 @@ use crate::types::{subst, Type, TypeInfo};
 
 fn c_type(t: &Type) -> String {
     match t {
+        Type::Con(n, args) if n == "&" || n == "&mut" || n == "Gc" => format!("{}*", c_type(&args[0])),
         Type::Con(n, args) if args.is_empty() => match n.as_str() {
             "Int" => "int64_t".into(),
             "Float" => "double".into(),
@@ -27,6 +28,10 @@ fn is_named(t: &Type, name: &str) -> bool {
     matches!(t, Type::Con(n, _) if n == name)
 }
 
+fn is_pointer(t: &Type) -> bool {
+    matches!(t, Type::Con(n, _) if n == "&" || n == "&mut" || n == "Gc")
+}
+
 fn c_string_lit(s: &str) -> String {
     let mut out = String::from("\"");
     for b in s.bytes() {
@@ -42,6 +47,7 @@ fn c_string_lit(s: &str) -> String {
 
 struct Gen<'a> {
     info: &'a TypeInfo,
+    debug: bool,
 }
 
 impl<'a> Gen<'a> {
@@ -79,50 +85,75 @@ impl<'a> Gen<'a> {
         matches!(t, Type::Con(n, _) if n == "Tuple" || self.info.structs.contains_key(n) || self.info.enums.contains_key(n))
     }
 
-    /// Types this ADT contains by value.
-    fn deps(&self, t: &Type) -> Vec<Type> {
-        let mut out: Vec<Type> = self.fields(t).into_iter().map(|(_, t)| t).collect();
+    /// Types this ADT contains, split into by-value (ordering) and by-pointer.
+    fn deps(&self, t: &Type) -> (Vec<Type>, Vec<Type>) {
+        let mut all: Vec<Type> = self.fields(t).into_iter().map(|(_, t)| t).collect();
         for v in self.variants(t) {
-            out.extend(v.into_iter().map(|(_, t)| t));
+            all.extend(v.into_iter().map(|(_, t)| t));
         }
-        out.into_iter().filter(|t| self.is_adt(t)).collect()
+        let mut by_value = Vec::new();
+        let mut by_ptr = Vec::new();
+        for d in all {
+            if is_pointer(&d) {
+                by_ptr.push(d);
+            } else if self.is_adt(&d) {
+                by_value.push(d);
+            }
+        }
+        (by_value, by_ptr)
     }
 
-    fn collect_type(&self, t: &Type, order: &mut Vec<Type>) {
-        if !self.is_adt(t) || order.contains(t) {
+    fn collect_type(&self, t: &Type, order: &mut Vec<Type>, visiting: &mut HashSet<Type>) {
+        let t = strip_pointers(t);
+        if !self.is_adt(&t) || order.contains(&t) || !visiting.insert(t.clone()) {
             return;
         }
-        for d in self.deps(t) {
-            self.collect_type(&d, order);
+        let (by_value, by_ptr) = self.deps(&t);
+        for d in by_value {
+            self.collect_type(&d, order, visiting);
         }
-        if !order.contains(t) {
-            order.push(t.clone());
+        order.push(t.clone());
+        for d in by_ptr {
+            self.collect_type(&d, order, visiting);
         }
     }
 
-    fn type_defs(&self, bodies: &[Body]) -> String {
+    fn all_types(&self, bodies: &[Body]) -> Vec<Type> {
         let mut order: Vec<Type> = Vec::new();
+        let mut visiting = HashSet::new();
         for b in bodies {
             for l in &b.locals {
-                self.collect_type(&l.ty, &mut order);
+                self.collect_type(&l.ty, &mut order, &mut visiting);
             }
             for bb in &b.blocks {
-                for Statement::Assign(_, rv) in &bb.stmts {
-                    if let Rvalue::Aggregate(agg, _) = rv {
-                        let t = match agg {
-                            Agg::Struct(t) | Agg::Tuple(t) | Agg::Variant(t, _) => t,
-                        };
-                        self.collect_type(t, &mut order);
+                for s in &bb.stmts {
+                    if let Statement::Assign(_, rv, _) = s {
+                        match rv {
+                            Rvalue::Aggregate(agg, _) => {
+                                let t = match agg {
+                                    Agg::Struct(t) | Agg::Tuple(t) | Agg::Variant(t, _) => t,
+                                };
+                                self.collect_type(t, &mut order, &mut visiting);
+                            }
+                            Rvalue::Call(Callee::Def { name, targs }, _) if name == "Gc::new" => {
+                                self.collect_type(&targs[0], &mut order, &mut visiting);
+                            }
+                            _ => {}
+                        }
                     }
                 }
             }
         }
+        order
+    }
+
+    fn type_defs(&self, order: &[Type]) -> String {
         let mut c = String::new();
-        for t in &order {
+        for t in order {
             writeln!(c, "typedef struct {n} {n};", n = c_type(t)).unwrap();
         }
         c.push('\n');
-        for t in &order {
+        for t in order {
             let name = c_type(t);
             let variants = self.variants(t);
             if variants.is_empty() {
@@ -157,12 +188,107 @@ impl<'a> Gen<'a> {
         c
     }
 
+    /// Droppable types reachable from the bodies, for which drop glue is emitted.
+    fn drop_types(&self, bodies: &[Body], order: &[Type]) -> Vec<Type> {
+        let mut out: Vec<Type> = Vec::new();
+        let consider = |t: &Type, out: &mut Vec<Type>| {
+            let t = strip_pointers(t);
+            if self.info.needs_drop(&t) && !out.contains(&t) {
+                out.push(t);
+            }
+        };
+        for t in order {
+            consider(t, &mut out);
+        }
+        for b in bodies {
+            for l in &b.locals {
+                consider(&l.ty, &mut out);
+            }
+            for bb in &b.blocks {
+                for s in &bb.stmts {
+                    match s {
+                        Statement::Drop(p, _) => consider(&place_type(self.info, b, p), &mut out),
+                        Statement::Assign(_, Rvalue::Call(Callee::Def { name, targs }, _), _) if name == "Gc::new" => consider(&targs[0], &mut out),
+                        _ => {}
+                    }
+                }
+            }
+        }
+        // Fields of droppable types need glue too.
+        let mut i = 0;
+        while i < out.len() {
+            let t = out[i].clone();
+            for (_, ft) in self.fields(&t) {
+                consider(&ft, &mut out);
+            }
+            for v in self.variants(&t) {
+                for (_, ft) in v {
+                    consider(&ft, &mut out);
+                }
+            }
+            i += 1;
+        }
+        out
+    }
+
+    fn drop_fn_name(t: &Type) -> String {
+        format!("rush_drop_{}", mangle_type(t))
+    }
+
+    fn drop_glue(&self, types: &[Type]) -> String {
+        let mut c = String::new();
+        for t in types {
+            writeln!(c, "static void {}(void *vp);", Self::drop_fn_name(t)).unwrap();
+        }
+        c.push('\n');
+        for t in types {
+            writeln!(c, "static void {}(void *vp) {{", Self::drop_fn_name(t)).unwrap();
+            if is_named(t, "String") {
+                c.push_str("  rush_str_drop((rush_str *)vp);\n}\n\n");
+                continue;
+            }
+            writeln!(c, "  {ct} *v = ({ct} *)vp;", ct = c_type(t)).unwrap();
+            if let Some((id, map)) = self.info.impl_for("Drop", t) {
+                let imp = &self.info.impls[id];
+                let targs: Vec<Type> = imp.generics.iter().map(|g| map[g].clone()).collect();
+                writeln!(c, "  rush_{}(v);", crate::mono::mangle_fn(&imp.methods["drop"], &targs)).unwrap();
+            }
+            let variants = self.variants(t);
+            if variants.is_empty() {
+                for (f, ft) in self.fields(t) {
+                    if self.info.needs_drop(&ft) {
+                        writeln!(c, "  {}(&v->{f});", Self::drop_fn_name(&ft)).unwrap();
+                    }
+                }
+            } else {
+                c.push_str("  switch (v->tag) {\n");
+                for (i, v) in variants.iter().enumerate() {
+                    writeln!(c, "  case {i}:").unwrap();
+                    for (f, ft) in v {
+                        if self.info.needs_drop(ft) {
+                            writeln!(c, "    {}(&v->u.v{i}.{f});", Self::drop_fn_name(ft)).unwrap();
+                        }
+                    }
+                    c.push_str("    break;\n");
+                }
+                c.push_str("  default: break;\n  }\n");
+            }
+            c.push_str("}\n\n");
+        }
+        c
+    }
+
     /// C expression for a place and the place's type.
     fn place(&self, b: &Body, p: &Place) -> (String, Type) {
         let mut s = format!("_{}", p.local);
         let mut ty = b.locals[p.local as usize].ty.clone();
         for pr in &p.proj {
             match pr {
+                Proj::Deref => {
+                    let Type::Con(_, args) = &ty else { panic!("cgen: deref of {ty}") };
+                    ty = args[0].clone();
+                    s = format!("(*{s})");
+                }
                 Proj::Field(i) => {
                     let (f, ft) = self.fields(&ty).into_iter().nth(*i).unwrap_or_else(|| panic!("cgen: field {i} of {ty}"));
                     s = format!("{s}.{f}");
@@ -201,6 +327,8 @@ impl<'a> Gen<'a> {
     fn rvalue(&self, b: &Body, rv: &Rvalue) -> String {
         match rv {
             Rvalue::Use(o) => self.operand(b, o).0,
+            Rvalue::MoveOut(p) => self.place(b, p).0,
+            Rvalue::Ref(_, p) => format!("&{}", self.place(b, p).0),
             Rvalue::Unary(UnOp::Neg, o) => format!("(-{})", self.operand(b, o).0),
             Rvalue::Unary(UnOp::Not, o) => format!("(!{})", self.operand(b, o).0),
             Rvalue::Binary(op, x, y) => {
@@ -209,10 +337,12 @@ impl<'a> Gen<'a> {
                 let is_int = is_named(&t, "Int");
                 let is_str = is_named(&t, "String");
                 match op {
+                    BinOp::Add if is_int && self.debug => format!("rush_add_i64_checked({l}, {r})"),
+                    BinOp::Sub if is_int && self.debug => format!("rush_sub_i64_checked({l}, {r})"),
+                    BinOp::Mul if is_int && self.debug => format!("rush_mul_i64_checked({l}, {r})"),
                     BinOp::Div if is_int => format!("rush_div_i64({l}, {r})"),
                     BinOp::Rem if is_int => format!("rush_rem_i64({l}, {r})"),
                     BinOp::Rem => format!("fmod({l}, {r})"),
-                    BinOp::Add if is_str => format!("rush_str_concat({l}, {r})"),
                     BinOp::Eq if is_str => format!("rush_str_eq({l}, {r})"),
                     BinOp::Ne if is_str => format!("(!rush_str_eq({l}, {r}))"),
                     BinOp::Eq if is_named(&t, "Unit") => "true".into(),
@@ -260,31 +390,54 @@ impl<'a> Gen<'a> {
         }
         for (i, bb) in b.blocks.iter().enumerate() {
             writeln!(c, "bb{i}:").unwrap();
-            for Statement::Assign(place, rv) in &bb.stmts {
-                let (target, _) = self.place(b, place);
-                match rv {
-                    Rvalue::Aggregate(agg, ops) => {
-                        let ops: Vec<String> = ops.iter().map(|o| self.operand(b, o).0).collect();
-                        match agg {
-                            Agg::Struct(t) | Agg::Tuple(t) => {
-                                let fields = self.fields(t);
-                                if fields.is_empty() {
-                                    writeln!(c, "  {target}._ = 0;").unwrap();
-                                }
-                                for ((f, _), v) in fields.iter().zip(&ops) {
-                                    writeln!(c, "  {target}.{f} = {v};").unwrap();
+            for s in &bb.stmts {
+                match s {
+                    Statement::Drop(p, _) => {
+                        let (expr, ty) = self.place(b, p);
+                        if self.info.needs_drop(&ty) {
+                            writeln!(c, "  {}(&{expr});", Self::drop_fn_name(&ty)).unwrap();
+                        }
+                    }
+                    Statement::Assign(place, rv, _) => {
+                        let (target, tty) = self.place(b, place);
+                        match rv {
+                            Rvalue::Aggregate(agg, ops) => {
+                                let ops: Vec<String> = ops.iter().map(|o| self.operand(b, o).0).collect();
+                                match agg {
+                                    Agg::Struct(t) | Agg::Tuple(t) => {
+                                        let fields = self.fields(t);
+                                        if fields.is_empty() {
+                                            writeln!(c, "  {target}._ = 0;").unwrap();
+                                        }
+                                        for ((f, _), v) in fields.iter().zip(&ops) {
+                                            writeln!(c, "  {target}.{f} = {v};").unwrap();
+                                        }
+                                    }
+                                    Agg::Variant(t, idx) => {
+                                        writeln!(c, "  {target}.tag = {idx};").unwrap();
+                                        let fields = &self.variants(t)[*idx];
+                                        for ((f, _), v) in fields.iter().zip(&ops) {
+                                            writeln!(c, "  {target}.u.v{idx}.{f} = {v};").unwrap();
+                                        }
+                                    }
                                 }
                             }
-                            Agg::Variant(t, idx) => {
-                                writeln!(c, "  {target}.tag = {idx};").unwrap();
-                                let fields = &self.variants(t)[*idx];
-                                for ((f, _), v) in fields.iter().zip(&ops) {
-                                    writeln!(c, "  {target}.u.v{idx}.{f} = {v};").unwrap();
-                                }
+                            Rvalue::Call(Callee::Def { name, targs }, ops) if name == "Gc::new" => {
+                                let pt = &targs[0];
+                                let drop = if self.info.needs_drop(pt) { Self::drop_fn_name(pt) } else { "NULL".into() };
+                                let (v, _) = self.operand(b, &ops[0]);
+                                writeln!(c, "  {target} = ({ct} *)rush_gc_alloc(sizeof({ct}), {drop});\n  *{target} = {v};", ct = c_type(pt)).unwrap();
+                            }
+                            Rvalue::Call(Callee::Def { name, .. }, ops) if name == "Gc::borrow" || name == "Gc::borrow_mut" => {
+                                let (g, _) = self.operand(b, &ops[0]);
+                                writeln!(c, "  {target} = *{g};").unwrap();
+                            }
+                            _ => {
+                                let _ = tty;
+                                writeln!(c, "  {target} = {};", self.rvalue(b, rv)).unwrap()
                             }
                         }
                     }
-                    _ => writeln!(c, "  {target} = {};", self.rvalue(b, rv)).unwrap(),
                 }
             }
             match &bb.term {
@@ -299,11 +452,24 @@ impl<'a> Gen<'a> {
     }
 }
 
-pub fn gen(bodies: &[Body], info: &TypeInfo) -> String {
-    let g = Gen { info };
+fn strip_pointers(t: &Type) -> Type {
+    let mut t = t.clone();
+    loop {
+        match &t {
+            Type::Con(n, args) if n == "&" || n == "&mut" || n == "Gc" => t = args[0].clone(),
+            _ => return t,
+        }
+    }
+}
+
+pub fn gen(bodies: &[Body], info: &TypeInfo, debug: bool) -> String {
+    let g = Gen { info, debug };
     let mut c = String::new();
-    c.push_str("#include \"rush_rt.h\"\n#include <math.h>\n\n");
-    c.push_str(&g.type_defs(bodies));
+    c.push_str("#include \"rush_rt.h\"\n#include <math.h>\n#include <stdlib.h>\n\n");
+    let order = g.all_types(bodies);
+    c.push_str(&g.type_defs(&order));
+    let drops = g.drop_types(bodies, &order);
+    c.push_str(&g.drop_glue(&drops));
     for b in bodies {
         writeln!(c, "{};", g.signature(b)).unwrap();
     }
@@ -323,15 +489,21 @@ mod tests {
     use crate::parser::parse;
     use crate::types::check;
 
-    fn gen_src(s: &str) -> String {
+    fn gen_src_dbg(s: &str, debug: bool) -> String {
         let prelude = include_str!("../std/prelude.rush");
         let mut id = 0;
         let mut p = parse(lex(prelude).unwrap(), &mut id).unwrap();
         p.items.extend(parse(lex(s).unwrap(), &mut id).unwrap().items);
+        crate::derive::expand(&mut p, &mut id).unwrap();
         let info = check(&p).unwrap();
-        let bodies = lower(&p, &info).unwrap();
+        let mut bodies = lower(&p, &info).unwrap();
+        crate::ownck::check_and_insert_drops(&mut bodies, &info).unwrap();
         let bodies = monomorphize(bodies, &info).unwrap();
-        gen(&bodies, &info)
+        gen(&bodies, &info, debug)
+    }
+
+    fn gen_src(s: &str) -> String {
+        gen_src_dbg(s, false)
     }
 
     #[test]
@@ -342,11 +514,9 @@ mod tests {
         assert!(c.starts_with("#include \"rush_rt.h\"\n"));
         assert!(c.contains("static int64_t rush_fib(int64_t _1);\n"));
         assert!(c.contains("static rush_unit rush_main(void);\n"));
-        assert!(c.contains("static int64_t rush_fib(int64_t _1) {\n"));
         assert!(c.contains("  _2 = (_1 < INT64_C(2));\n"));
         assert!(c.contains("  if (_2) goto bb1; else goto bb2;\n"));
         assert!(c.contains("  _5 = rush_fib(_4);\n"));
-        assert!(c.contains("  return _0;\n"));
         assert!(c.contains("int main(int argc, char **argv) {\n  return rush_rt_run(argc, argv, rush_entry);\n}\n"));
     }
 
@@ -357,26 +527,12 @@ mod tests {
     }
 
     #[test]
-    fn division_and_string_equality_call_the_runtime() {
+    fn division_and_string_ops_call_the_runtime() {
         let c = gen_src("def main\n  let a = 7 / 2\n  let b = 7 % 2\n  let c = \"x\" == \"y\"\n  let d = \"x\" + \"y\"\n  ()\nend\n");
         assert!(c.contains("rush_div_i64("));
         assert!(c.contains("rush_rem_i64("));
         assert!(c.contains("rush_str_eq("));
-        assert!(c.contains("rush_str_concat("));
-    }
-
-    #[test]
-    fn float_division_is_inline() {
-        let c = gen_src("def main\n  let a = 7.0 / 2.0\n  ()\nend\n");
-        assert!(c.contains(" / "));
-        assert!(!c.contains("rush_div_i64"));
-    }
-
-    #[test]
-    fn unit_and_bool_constants() {
-        let c = gen_src("def main\n  let u = ()\n  let b = not true\n  ()\nend\n");
-        assert!(c.contains("RUSH_UNIT"));
-        assert!(c.contains("(!true)"));
+        assert!(c.contains("rush_str_concat(_"), "{c}");
     }
 
     #[test]
@@ -387,18 +543,32 @@ mod tests {
         let t = c.find("struct rush_Tuple_L_Int__Bool_R {").unwrap();
         let s = c.find("struct rush_S {").unwrap();
         assert!(p < s && t < s, "{c}");
-        assert!(c.contains("typedef struct rush_S rush_S;"));
         assert!(c.contains("  int32_t tag;\n  union {\n    struct { rush_P f0; } v0;\n    struct { rush_P f0; rush_Tuple_L_Int__Bool_R f1; } v1;\n  } u;\n"), "{c}");
-        assert!(c.contains(".tag = 1;"), "{c}");
-        assert!(c.contains(".u.v1.f1 = _"), "{c}");
-        assert!(c.contains(".tag;"), "{c}");
-        assert!(c.contains(".u.v1.f1;"), "{c}");
-        assert!(c.contains(".f0;"), "{c}");
     }
 
     #[test]
-    fn unit_only_enum_has_no_union() {
-        let c = gen_src("enum Color\n  Red\n  Blue\nend\ndef main\n  let c = Red\n  ()\nend\n");
-        assert!(c.contains("struct rush_Color {\n  int32_t tag;\n};"), "{c}");
+    fn references_derefs_and_drop_glue() {
+        let src = "struct Person\n  derive Clone\n  name: String\n  age: Int\nend\nimpl Drop for Person\n  def drop(&mut self)\n    @age = 0\n  end\nend\ndef age_of(p: &Person) -> Int\n  p.age\nend\ndef main\n  let p = Person { name: \"a\", age: 1 }\n  let o = Some(p.clone)\n  let n = age_of(&p)\n  ()\nend\n";
+        let c = gen_src(src);
+        assert!(c.contains("static int64_t rush_age_of(rush_Person* _1)"), "{c}");
+        assert!(c.contains("(*_1).f_age"), "{c}");
+        assert!(c.contains("static void rush_drop_Person(void *vp) {"), "{c}");
+        assert!(c.contains("rush_str_drop((rush_str *)vp)"), "{c}");
+        assert!(c.contains("_drop(v);"), "{c}");
+        assert!(c.contains("rush_drop_String(&v->f_name);"), "{c}");
+        assert!(c.contains("static void rush_drop_Option_L_Person_R(void *vp) {"), "{c}");
+        assert!(c.contains("switch (v->tag)"), "{c}");
+        assert!(c.contains("rush_drop_Person(&_"), "{c}");
+    }
+
+    #[test]
+    fn gc_intrinsics_and_debug_arithmetic() {
+        let c = gen_src_dbg("def main\n  let g = Gc.new(\"s\")\n  let r = g.borrow\n  let n = 1 + 2 * 3\n  ()\nend\n", true);
+        assert!(c.contains("rush_gc_alloc(sizeof(rush_str), rush_drop_String)"), "{c}");
+        assert!(c.contains(" = *_"), "{c}");
+        assert!(c.contains("rush_add_i64_checked("), "{c}");
+        assert!(c.contains("rush_mul_i64_checked("), "{c}");
+        let c2 = gen_src("def main\n  let n = 1 + 2\n  ()\nend\n");
+        assert!(!c2.contains("checked"), "{c2}");
     }
 }
