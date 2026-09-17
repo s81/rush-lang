@@ -3,7 +3,7 @@ use std::fmt::Write;
 
 use crate::ast::*;
 use crate::diag::Diagnostic;
-use crate::types::{Type, TypeInfo};
+use crate::types::{GlobalKind, Type, TypeInfo};
 
 pub type LocalId = u32;
 pub type BlockId = u32;
@@ -90,7 +90,7 @@ struct Lowerer<'a> {
 
 fn lower_def(d: &Def, info: &TypeInfo) -> Result<Body, Diagnostic> {
     let g = &info.globals[&d.name];
-    let (params, ret) = g.ty.uncurry_n(g.n_params);
+    let (params, ret) = g.scheme.ty.uncurry_n(g.n_params);
     let mut l = Lowerer {
         body: Body {
             name: d.name.clone(),
@@ -174,7 +174,7 @@ impl<'a> Lowerer<'a> {
                     if g.n_params != 0 {
                         return Err(Diagnostic::new(e.span, "functions as values are not supported in this version"));
                     }
-                    let callee = if g.is_extern { Callee::Extern(n.clone()) } else { Callee::Def(n.clone()) };
+                    let callee = if matches!(g.kind, GlobalKind::Extern) { Callee::Extern(n.clone()) } else { Callee::Def(n.clone()) };
                     let t = self.temp(self.ty(e));
                     self.push(Statement::Assign(t, Rvalue::Call(callee, vec![])));
                     Operand::Local(t)
@@ -220,7 +220,7 @@ impl<'a> Lowerer<'a> {
                 if args.len() != g.n_params {
                     return Err(Diagnostic::new(e.span, "partial application is not supported in this version"));
                 }
-                let callee = if g.is_extern { Callee::Extern(name) } else { Callee::Def(name) };
+                let callee = if matches!(g.kind, GlobalKind::Extern) { Callee::Extern(name) } else { Callee::Def(name) };
                 let mut ops = Vec::new();
                 for a in args {
                     ops.push(self.expr(a)?);

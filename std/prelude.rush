@@ -3,3 +3,96 @@ extern "C" def print(s: String) -> Unit
 extern "C" def int_to_s(v: Int) -> String
 extern "C" def float_to_s(v: Float) -> String
 extern "C" def bool_to_s(v: Bool) -> String
+extern "C" def str_concat(a: String, b: String) -> String
+
+trait Show
+  def to_s(&self) -> String
+end
+
+trait Eq
+  def eq(&self, other: Self) -> Bool
+end
+
+enum Option[T]
+  Some(T)
+  None
+end
+
+impl Show for Int
+  def to_s(&self)
+    int_to_s(self)
+  end
+end
+
+impl Show for Float
+  def to_s(&self)
+    float_to_s(self)
+  end
+end
+
+impl Show for Bool
+  def to_s(&self)
+    bool_to_s(self)
+  end
+end
+
+impl Show for String
+  def to_s(&self)
+    self
+  end
+end
+
+impl Show for Unit
+  def to_s(&self)
+    "()"
+  end
+end
+
+impl[T: Show] Show for Option[T]
+  def to_s(&self)
+    case self
+    in Some(v) then "Some(#{v})"
+    in None then "None"
+    end
+  end
+end
+
+impl Eq for Int
+  def eq(&self, other: Int)
+    self == other
+  end
+end
+
+impl Eq for Float
+  def eq(&self, other: Float)
+    self == other
+  end
+end
+
+impl Eq for String
+  def eq(&self, other: String)
+    self == other
+  end
+end
+
+impl Eq for Bool
+  def eq(&self, other: Bool)
+    self == other
+  end
+end
+
+impl Eq for Unit
+  def eq(&self, other: Unit)
+    true
+  end
+end
+
+impl[T: Eq] Eq for Option[T]
+  def eq(&self, other: Option[T])
+    case (self, other)
+    in (Some(a), Some(b)) then a == b
+    in (None, None) then true
+    in (_, _) then false
+    end
+  end
+end

@@ -453,7 +453,7 @@ impl Parser {
         if self.is_kw("let") {
             let start = self.bump().span;
             let mutable = self.eat_kw("mut");
-            let pat = if self.is_op("(") {
+            let pat = if self.is_op("(") || matches!(self.peek(), Tok::Ident(n) if is_camel(n)) {
                 self.pattern()?
             } else {
                 let (name, sp) = self.expect_ident()?;
