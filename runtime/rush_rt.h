@@ -11,6 +11,9 @@ typedef struct { char _; } rush_unit;
 typedef struct { uint8_t *ptr; size_t len; size_t cap; } rush_str;
 
 void rush_rt_init(int argc, char **argv);
+/* Records the GC stack base in its own frame, then runs `entry`. Every frame the program
+   creates is below this one, so the collector scans all of them. */
+int rush_rt_run(int argc, char **argv, void (*entry)(void));
 void rush_panic(const char *msg);
 void rush_unreachable(void);
 rush_str rush_str_lit(const char *s, size_t len);

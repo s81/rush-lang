@@ -9,10 +9,17 @@
 static uintptr_t rush_stack_base;
 
 void rush_rt_init(int argc, char **argv) {
+    (void)argc;
+    (void)argv;
+}
+
+int rush_rt_run(int argc, char **argv, void (*entry)(void)) {
     volatile uintptr_t marker = 0;
     (void)argc;
     (void)argv;
     rush_stack_base = (uintptr_t)&marker;
+    entry();
+    return 0;
 }
 
 void rush_panic(const char *msg) {
