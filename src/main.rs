@@ -1,4 +1,5 @@
 mod ast;
+mod cgen;
 mod diag;
 mod lexer;
 mod mir;

@@ -1,0 +1,5 @@
+extern "C" def puts(s: String) -> Unit
+extern "C" def print(s: String) -> Unit
+extern "C" def int_to_s(v: Int) -> String
+extern "C" def float_to_s(v: Float) -> String
+extern "C" def bool_to_s(v: Bool) -> String
