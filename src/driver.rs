@@ -1,7 +1,7 @@
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
-use crate::{cgen, diag, lexer, mir, parser, types};
+use crate::{cgen, diag, lexer, mir, mono, parser, types};
 
 const PRELUDE: &str = include_str!("../std/prelude.rush");
 const RT_C: &str = include_str!("../runtime/rush_rt.c");
@@ -26,6 +26,7 @@ pub fn compile_to_c(path: &str, src: &str) -> Result<String, String> {
         prog.items.extend(parser::parse(lexer::lex(src)?, &mut id)?.items);
         let info = types::check(&prog)?;
         let bodies = mir::lower(&prog, &info)?;
+        let bodies = mono::monomorphize(bodies, &info)?;
         Ok(cgen::gen(&bodies, &info))
     };
     go().map_err(|d| diag::render(path, src, &d))

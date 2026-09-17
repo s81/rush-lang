@@ -1,0 +1,10 @@
+enum Shape
+  Circle(Float)
+  Rect(Float, Float)
+end
+
+def main
+  case Circle(1.0)
+  in Circle(r) then puts("c")
+  end
+end

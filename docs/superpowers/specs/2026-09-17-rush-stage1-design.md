@@ -93,6 +93,7 @@ end
 - `enum Name` with `Variant`, `Variant(T1, T2)`, or `Variant { f: T }` lines.
 - `trait Name` with `def` signatures and optional default bodies. `trait Name: Super` for supertraits. `type Item` for associated types.
 - `impl Trait for Type` and `impl Type` for inherent methods. `impl[T: Bound] Trait for Type[T]` for generic instances.
+- A `derive Show, Eq, Copy` line inside a `struct` or `enum` body generates those instances (decided 2026-09-17; implemented from Plan 3 on).
 - `import name` loads `name.rush` from the same directory. Everything top-level in a file is exported. One file is one module.
 - `extern "C" def name(p: T) -> R` declares a runtime primitive.
 
@@ -195,6 +196,16 @@ Every error reports file, line, column, and a one-line message, with the offendi
 
 Stage 1 is done when the section 6 suite passes on Windows with `tcc`, and the generated C for every program in `tests/programs` compiles and runs with `gcc` or `clang` on Linux and macOS.
 
+## Plan sequence inside Stage 1 (decided 2026-09-17)
+
+| Plan | Delivers |
+|---|---|
+| 1 | Pipeline end to end, primitives, functions, control flow, CLI, golden tests (shipped) |
+| 2 | `struct`, `enum`, `case`/`in` with exhaustiveness, tuples, generics with monomorphization, traits with default methods and supertraits, `Show` interpolation, `Eq` (shipped) |
+| 3 | Ownership: moves, `Copy`, `&`/`&mut`, NLL borrow checker, drop insertion, `Gc[T]`, the GC, `derive` |
+| 4 | Closures and blocks, `move`, currying and partial application, `\|>`, `?`, `>>=`, `mdo`, `for`, `loop`, ranges, symbols, higher-kinded traits (Functor/Applicative/Monad) |
+| 5 | Stdlib (`List`, `Map`, `StringBuilder`, `Iterator` with associated types, `Ord`, IO), list patterns, `Char`, sized integers, `import`, `rush test`, Linux/macOS verification |
+
 ## Known corners cut in Stage 1
 
 - No lifetime annotations; functions that need them must return owned values.
@@ -202,3 +213,7 @@ Stage 1 is done when the section 6 suite passes on Windows with `tcc`, and the g
 - No paren-less command calls.
 - Conservative GC may retain garbage that a stack word happens to resemble.
 - No package manager or multi-directory modules.
+- Until Plan 3, `&T`, `&mut T`, `&e`, and `*e` parse and are erased.
+- Trait method signatures and inherent methods must annotate parameters; a trait impl method may omit types and take them from the trait. A trait signature without a return type returns `Unit`.
+- Generic trait methods (a method with its own type parameters) are rejected at monomorphization until a plan needs them.
+- Unannotated mutually recursive functions are inferred monomorphically within their group.

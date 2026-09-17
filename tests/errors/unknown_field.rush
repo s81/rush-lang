@@ -1,0 +1,8 @@
+struct Point
+  x: Float
+end
+
+def main
+  let p = Point { x: 1.0 }
+  puts(float_to_s(p.z))
+end

@@ -1,0 +1,31 @@
+trait Named: Show
+  def name(&self) -> String
+end
+
+struct Dog
+  age: Int
+end
+
+impl Show for Dog
+  def to_s(&self)
+    "Dog(#{@age})"
+  end
+end
+
+impl Named for Dog
+  def name(&self)
+    "rex"
+  end
+end
+
+def introduce[T: Named](x: T) -> String
+  "#{x.name} is #{x}"
+end
+
+def twice(x)
+  introduce(x) + " / " + introduce(x)
+end
+
+def main
+  puts(twice(Dog { age: 3 }))
+end

@@ -1,0 +1,7 @@
+def f[T](x: T) -> String
+  x.to_s
+end
+
+def main
+  puts(f(1))
+end

@@ -4,6 +4,7 @@ mod diag;
 mod driver;
 mod lexer;
 mod mir;
+mod mono;
 mod parser;
 mod types;
 
