@@ -399,6 +399,8 @@ impl<'a> Lowerer<'a> {
                 let place = self.as_place(rv, rty);
                 Operand::Place(place.field(*i))
             }
+            // Temporary until Task 5 of Plan 3a: references are still erased.
+            ExprKind::Ref(_, x) | ExprKind::Deref(x) => self.expr(x)?,
             ExprKind::Unary(op, x) => {
                 let v = self.expr(x)?;
                 let ty = self.ty(e);

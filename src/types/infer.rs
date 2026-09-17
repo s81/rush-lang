@@ -578,6 +578,8 @@ impl<'a> Checker<'a> {
                     other => return Err(Diagnostic::new(e.span, format!("cannot index `{other}` with `.{i}`"))),
                 }
             }
+            // Temporary until Task 4 of Plan 3a: references are still erased.
+            ExprKind::Ref(_, x) | ExprKind::Deref(x) => self.expr(x)?,
             ExprKind::Unary(UnOp::Neg, x) => {
                 let t = self.expr(x)?;
                 self.numeric(&t, x.span, false)?;
@@ -1025,6 +1027,7 @@ fn collect_refs(e: &Expr, out: &mut Vec<String>) {
             args.iter().flatten().for_each(|a| collect_refs(a, out));
         }
         ExprKind::TupleIndex(r, _) => collect_refs(r, out),
+        ExprKind::Ref(_, x) | ExprKind::Deref(x) => collect_refs(x, out),
         ExprKind::Unary(_, x) => collect_refs(x, out),
         ExprKind::Binary(_, a, b) => {
             collect_refs(a, out);
@@ -1096,6 +1099,7 @@ fn collect_cases<'a>(e: &'a Expr, out: &mut Vec<(&'a Expr, &'a [Arm], Span)>) {
             args.iter().flatten().for_each(|a| collect_cases(a, out));
         }
         ExprKind::TupleIndex(r, _) => collect_cases(r, out),
+        ExprKind::Ref(_, x) | ExprKind::Deref(x) => collect_cases(x, out),
         ExprKind::Unary(_, x) => collect_cases(x, out),
         ExprKind::Binary(_, a, b) => {
             collect_cases(a, out);

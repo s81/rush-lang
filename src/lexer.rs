@@ -30,7 +30,7 @@ pub struct Token {
 const KEYWORDS: &[&str] = &[
     "def", "end", "let", "mut", "if", "elsif", "else", "while", "for", "in", "loop", "break",
     "next", "return", "case", "then", "struct", "enum", "trait", "impl", "import", "move", "mdo",
-    "self", "true", "false", "and", "or", "not", "type", "extern", "Self",
+    "self", "true", "false", "and", "or", "not", "type", "extern", "Self", "derive",
 ];
 
 // Longest operators first so that `..` wins over `.` and `|>` over `|`.

@@ -63,6 +63,7 @@ pub struct Param {
 pub struct StructDef {
     pub name: String,
     pub generics: Generics,
+    pub derives: Vec<String>,
     pub fields: Vec<FieldDef>,
     pub span: Span,
 }
@@ -78,6 +79,7 @@ pub struct FieldDef {
 pub struct EnumDef {
     pub name: String,
     pub generics: Generics,
+    pub derives: Vec<String>,
     pub variants: Vec<VariantDef>,
     pub span: Span,
 }
@@ -203,6 +205,10 @@ pub enum ExprKind {
     /// `p.x`, `p.m`, `p.m(a)`; `args` is `None` when no parentheses were written
     Dot { recv: Box<Expr>, name: String, args: Option<Vec<Expr>> },
     TupleIndex(Box<Expr>, usize),
+    /// `&e` (false) or `&mut e` (true)
+    Ref(bool, Box<Expr>),
+    /// `*e`
+    Deref(Box<Expr>),
     Unary(UnOp, Box<Expr>),
     Binary(BinOp, Box<Expr>, Box<Expr>),
     Call(Box<Expr>, Vec<Expr>),
