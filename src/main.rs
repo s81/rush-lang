@@ -1,5 +1,6 @@
 mod ast;
 mod cgen;
+mod derive;
 mod diag;
 mod driver;
 mod lexer;
