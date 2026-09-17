@@ -311,7 +311,7 @@ pub fn gen(bodies: &[Body], info: &TypeInfo) -> String {
     for b in bodies {
         g.body(b, &mut c);
     }
-    c.push_str("int main(int argc, char **argv) {\n  rush_rt_init(argc, argv);\n  rush_main();\n  return 0;\n}\n");
+    c.push_str("static void rush_entry(void) {\n  rush_main();\n}\n\nint main(int argc, char **argv) {\n  return rush_rt_run(argc, argv, rush_entry);\n}\n");
     c
 }
 
@@ -347,7 +347,7 @@ mod tests {
         assert!(c.contains("  if (_2) goto bb1; else goto bb2;\n"));
         assert!(c.contains("  _5 = rush_fib(_4);\n"));
         assert!(c.contains("  return _0;\n"));
-        assert!(c.contains("int main(int argc, char **argv) {\n  rush_rt_init(argc, argv);\n  rush_main();\n  return 0;\n}\n"));
+        assert!(c.contains("int main(int argc, char **argv) {\n  return rush_rt_run(argc, argv, rush_entry);\n}\n"));
     }
 
     #[test]

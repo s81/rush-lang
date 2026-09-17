@@ -33,17 +33,18 @@ static int64_t churn(int64_t keep_n) {
     return sum;
 }
 
-int main(int argc, char **argv) {
-    rush_rt_init(argc, argv);
+static int status = 1;
+
+static void body(void) {
     int64_t sum = churn(100);
-    if (sum < 0) return 1;
+    if (sum < 0) return;
     if (sum != 45 + 1000) {
         printf("bad sum %lld\n", (long long)sum);
-        return 1;
+        return;
     }
     if (drops < 99997 || drops > 100000) {
         printf("drops %ld (expected about 100000)\n", drops);
-        return 1;
+        return;
     }
     /* Interior pointers keep objects alive too. */
     pair *p = (pair *)rush_gc_alloc(sizeof(pair), count_inner_drop);
@@ -52,16 +53,21 @@ int main(int argc, char **argv) {
     rush_gc_collect();
     if (inner_drops != 0) {
         printf("interior pointer lost the object\n");
-        return 1;
+        return;
     }
     *inner = 7;
     /* Strings with capacity are freed by drop; literals are not. */
     rush_str lit = rush_str_lit("abc", 3);
     rush_str owned = rush_str_clone(&lit);
-    if (!rush_str_eq(lit, owned) || owned.cap == 0) return 1;
+    if (!rush_str_eq(lit, owned) || owned.cap == 0) return;
     rush_str_drop(&owned);
     rush_str_drop(&lit);
-    if (rush_add_i64_checked(1, 2) != 3 || rush_mul_i64_checked(-3, 4) != -12) return 1;
+    if (rush_add_i64_checked(1, 2) != 3 || rush_mul_i64_checked(-3, 4) != -12) return;
     puts("gc ok");
-    return 0;
+    status = 0;
+}
+
+int main(int argc, char **argv) {
+    rush_rt_run(argc, argv, body);
+    return status;
 }
