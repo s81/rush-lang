@@ -4,7 +4,9 @@
 #include <string.h>
 
 static long drops;
+static long inner_drops;
 static void count_drop(void *p) { (void)p; drops++; }
+static void count_inner_drop(void *p) { (void)p; inner_drops++; }
 
 typedef struct { int64_t a; int64_t b; } pair;
 
@@ -44,13 +46,11 @@ int main(int argc, char **argv) {
         return 1;
     }
     /* Interior pointers keep objects alive too. */
-    rush_gc_collect();
-    int64_t before = rush_gc_live_objects();
-    pair *p = (pair *)rush_gc_alloc(sizeof(pair), count_drop);
+    pair *p = (pair *)rush_gc_alloc(sizeof(pair), count_inner_drop);
     int64_t *inner = &p->b;
     p = NULL;
     rush_gc_collect();
-    if (rush_gc_live_objects() < before + 1) {
+    if (inner_drops != 0) {
         printf("interior pointer lost the object\n");
         return 1;
     }
