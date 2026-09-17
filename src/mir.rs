@@ -284,6 +284,7 @@ impl<'a> Lowerer<'a> {
     }
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 fn fmt_operand(o: &Operand) -> String {
     match o {
         Operand::Local(id) => format!("_{id}"),
@@ -295,6 +296,8 @@ fn fmt_operand(o: &Operand) -> String {
     }
 }
 
+/// Human-readable MIR, used by tests and later by a `--dump-mir` flag.
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn dump(b: &Body) -> String {
     let mut s = String::new();
     let params: Vec<String> = (1..=b.n_params).map(|i| format!("_{i}: {}", b.locals[i].ty)).collect();

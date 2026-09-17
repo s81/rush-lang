@@ -1,3 +1,6 @@
 .rush-build/
 target/
 .remember/
+tests/programs/*
+!tests/programs/*.rush
+!tests/programs/*.out

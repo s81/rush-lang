@@ -1,0 +1,13 @@
+def avg(a: Float, b: Float) -> Float
+  (a + b) / 2.0
+end
+
+def main
+  puts(float_to_s(avg(1.0, 2.0)))
+  puts(float_to_s(4.0))
+  puts(bool_to_s(1 < 2 and not false))
+  puts(int_to_s(7 / 2))
+  puts(int_to_s(-7 % 3))
+  puts(bool_to_s("a" == "a"))
+  puts(bool_to_s("a" != "a"))
+end
