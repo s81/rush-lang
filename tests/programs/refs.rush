@@ -1,0 +1,46 @@
+enum Shape
+  Circle(Float)
+  Rect(Float, Float)
+end
+
+struct Point
+  derive Copy, Show
+  x: Float
+  y: Float
+end
+
+struct Counter
+  n: Int
+end
+
+impl Counter
+  def bump(&mut self)
+    @n += 1
+  end
+end
+
+def area(s: &Shape) -> Float
+  case s
+  in Circle(r) then 3.0 * r * r
+  in Rect(w, h) then w * h
+  end
+end
+
+def sum(a: &Int, b: &Int) -> Int
+  a + b
+end
+
+def main
+  let s = Rect(2.0, 3.0)
+  puts("#{area(&s)} #{area(&s)}")
+  let x = 40
+  let r = &x
+  puts("#{sum(&x, r) + *r}")
+  let mut c = Counter { n: 0 }
+  c.bump
+  c.bump
+  puts("#{c.n}")
+  let p = Point { x: 1.0, y: 2.0 }
+  let p2 = p
+  puts("#{p} #{p2} #{p.x + p2.y}")
+end

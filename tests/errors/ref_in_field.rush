@@ -1,0 +1,7 @@
+struct S
+  r: &Int
+end
+
+def main
+  ()
+end

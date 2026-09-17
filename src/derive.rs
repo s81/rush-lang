@@ -43,10 +43,6 @@ fn type_text(t: &TypeExpr) -> String {
     }
 }
 
-fn is_string(t: &TypeExpr) -> bool {
-    matches!(t, TypeExpr::Name(n, a, _) if n == "String" && a.is_empty())
-}
-
 /// `impl[A: Trait, B: Trait] Trait for Name[A, B]` header.
 fn header(name: &str, generics: &Generics, trait_name: &str) -> String {
     let bound = if trait_name == "Copy" { "Copy" } else { trait_name };
@@ -83,11 +79,7 @@ fn gen_struct(s: &StructDef, derive: &str) -> String {
             let body = if s.fields.is_empty() {
                 format!("\"{}\"", s.name)
             } else {
-                let parts: Vec<String> = s
-                    .fields
-                    .iter()
-                    .map(|f| if is_string(&f.ty) { format!("{}: \\\"#{{@{}}}\\\"", f.name, f.name) } else { format!("{}: #{{@{}}}", f.name, f.name) })
-                    .collect();
+                let parts: Vec<String> = s.fields.iter().map(|f| format!("{}: #{{@{}.inspect}}", f.name, f.name)).collect();
                 format!("\"{} {{ {} }}\"", s.name, parts.join(", "))
             };
             format!("{h}\n  def to_s(&self)\n    {body}\n  end\nend\n")
@@ -139,11 +131,11 @@ fn gen_enum(e: &EnumDef, derive: &str) -> String {
                 let (pat, names) = variant_binders(v, "a");
                 let text = match &v.fields {
                     VariantFields::Unit => format!("\"{}\"", v.name),
-                    VariantFields::Tuple(_) => format!("\"{}({})\"", v.name, names.iter().map(|n| format!("#{{{n}}}")).collect::<Vec<_>>().join(", ")),
+                    VariantFields::Tuple(_) => format!("\"{}({})\"", v.name, names.iter().map(|n| format!("#{{{n}.inspect}}")).collect::<Vec<_>>().join(", ")),
                     VariantFields::Named(fs) => format!(
                         "\"{} {{ {} }}\"",
                         v.name,
-                        fs.iter().zip(&names).map(|(f, n)| format!("{}: #{{{n}}}", f.name)).collect::<Vec<_>>().join(", ")
+                        fs.iter().zip(&names).map(|(f, n)| format!("{}: #{{{n}.inspect}}", f.name)).collect::<Vec<_>>().join(", ")
                     ),
                 };
                 arms.push_str(&format!("    in {pat} then {text}\n"));
@@ -333,7 +325,7 @@ mod tests {
         let p = parse_src("struct Person\n  derive Show, Eq, Clone\n  name: String\n  age: Int\nend\n");
         assert_eq!(
             generate(&p.items[0], "Show"),
-            "impl Show for Person\n  def to_s(&self)\n    \"Person { name: \\\"#{@name}\\\", age: #{@age} }\"\n  end\nend\n"
+            "impl Show for Person\n  def to_s(&self)\n    \"Person { name: #{@name.inspect}, age: #{@age.inspect} }\"\n  end\nend\n"
         );
         assert_eq!(generate(&p.items[0], "Eq"), "impl Eq for Person\n  def eq(&self, other: &Person)\n    @name == other.name and @age == other.age\n  end\nend\n");
         assert_eq!(generate(&p.items[0], "Clone"), "impl Clone for Person\n  def clone(&self)\n    Person { name: @name.clone, age: @age.clone }\n  end\nend\n");
@@ -349,7 +341,7 @@ mod tests {
         let p = parse_src("enum S\n  derive Show, Eq, Clone\n  C(Float)\n  R { w: Float, h: Float }\n  E\nend\n");
         assert_eq!(
             generate(&p.items[0], "Show"),
-            "impl Show for S\n  def to_s(&self)\n    case self\n    in C(a0) then \"C(#{a0})\"\n    in R { w: a0, h: a1 } then \"R { w: #{a0}, h: #{a1} }\"\n    in E then \"E\"\n    end\n  end\nend\n"
+            "impl Show for S\n  def to_s(&self)\n    case self\n    in C(a0) then \"C(#{a0.inspect})\"\n    in R { w: a0, h: a1 } then \"R { w: #{a0.inspect}, h: #{a1.inspect} }\"\n    in E then \"E\"\n    end\n  end\nend\n"
         );
         assert_eq!(
             generate(&p.items[0], "Eq"),

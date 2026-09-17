@@ -1,0 +1,8 @@
+struct P
+  name: String
+end
+
+def main
+  let p = P { name: "a" }
+  let n = p.name
+end

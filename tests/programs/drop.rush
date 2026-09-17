@@ -1,0 +1,31 @@
+struct Noisy
+  name: String
+end
+
+impl Drop for Noisy
+  def drop(&mut self)
+    puts("drop #{@name}")
+  end
+end
+
+def consume(n: Noisy) -> Unit
+  puts("consuming #{n.name}")
+end
+
+def maybe(flag: Bool) -> Unit
+  let c = Noisy { name: "c" }
+  if flag
+    consume(c)
+  end
+  puts("maybe done")
+end
+
+def main
+  let a = Noisy { name: "a" }
+  let mut b = Noisy { name: "b1" }
+  consume(a)
+  b = Noisy { name: "b2" }
+  maybe(true)
+  maybe(false)
+  puts("end of main")
+end

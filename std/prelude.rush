@@ -10,6 +10,9 @@ extern "C" def gc_live() -> Int
 
 trait Show
   def to_s(&self) -> String
+  def inspect(&self) -> String
+    self.to_s
+  end
 end
 
 trait Eq
@@ -53,6 +56,9 @@ end
 impl Show for String
   def to_s(&self)
     self.clone
+  end
+  def inspect(&self)
+    "\"#{self}\""
   end
 end
 

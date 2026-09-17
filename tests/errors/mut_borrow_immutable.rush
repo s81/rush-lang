@@ -1,0 +1,14 @@
+struct C
+  n: Int
+end
+
+impl C
+  def bump(&mut self)
+    @n += 1
+  end
+end
+
+def main
+  let c = C { n: 0 }
+  c.bump
+end

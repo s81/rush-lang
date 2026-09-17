@@ -1,0 +1,9 @@
+def id(s: String) -> String
+  s
+end
+
+def main
+  let s = "a"
+  let r = &s
+  let t = id(r)
+end

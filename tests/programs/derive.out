@@ -1,0 +1,4 @@
+Pair { first: 1, second: "one" } true false
+Circle(1.0) Rect { w: 2.0, h: 3.0 } Empty
+true false true
+Pt { x: 5 } true

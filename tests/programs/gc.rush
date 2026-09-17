@@ -1,0 +1,32 @@
+struct Node
+  name: String
+  link: Option[Gc[Node]]
+end
+
+def make(i: Int) -> Gc[Node]
+  Gc.new(Node { name: "node #{i}", link: None })
+end
+
+def churn(n: Int) -> Unit
+  let mut i = 0
+  while i < n
+    let g = make(i)
+    i += 1
+  end
+end
+
+def main
+  let keep = make(42)
+  churn(100000)
+  gc_collect_now
+  puts("live small: #{gc_live < 100}")
+  puts("kept #{keep.borrow.name}")
+  let mut last = make(0)
+  let mut i = 0
+  while i < 1000
+    last = Gc.new(Node { name: "node #{i}", link: Some(last) })
+    i += 1
+  end
+  gc_collect_now
+  puts("chain #{last.borrow.name} #{gc_live > 1000}")
+end

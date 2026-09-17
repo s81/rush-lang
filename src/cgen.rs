@@ -468,12 +468,12 @@ pub fn gen(bodies: &[Body], info: &TypeInfo, debug: bool) -> String {
     c.push_str("#include \"rush_rt.h\"\n#include <math.h>\n#include <stdlib.h>\n\n");
     let order = g.all_types(bodies);
     c.push_str(&g.type_defs(&order));
-    let drops = g.drop_types(bodies, &order);
-    c.push_str(&g.drop_glue(&drops));
     for b in bodies {
         writeln!(c, "{};", g.signature(b)).unwrap();
     }
     c.push('\n');
+    let drops = g.drop_types(bodies, &order);
+    c.push_str(&g.drop_glue(&drops));
     for b in bodies {
         g.body(b, &mut c);
     }
