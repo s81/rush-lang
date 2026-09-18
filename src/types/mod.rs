@@ -297,6 +297,9 @@ pub struct TypeInfo {
     pub pat_by_ref: HashMap<PatId, bool>,
     /// Bindings that move a non-Copy value out of the scrutinee.
     pub pat_moves: HashSet<PatId>,
+    /// Function or trait method (`Trait::method`) -> index of the parameter its returned
+    /// references borrow from (elision). Absent when the declared result holds no reference.
+    pub elided: HashMap<String, usize>,
 }
 
 /// One-way match of a pattern type (impl generics as `Param`s) against a ground type.
@@ -337,14 +340,61 @@ impl TypeInfo {
             Type::Param(p) => param_copy(p),
             Type::Fn(..) => true,
             Type::Con(n, args) => match n.as_str() {
-                "Int" | "Float" | "Bool" | "Unit" | "&" | "&mut" | "Gc" => true,
-                "String" => false,
+                "Int" | "Float" | "Bool" | "Unit" | "&" | "Gc" => true,
+                "String" | "&mut" => false,
                 "Tuple" => args.iter().all(|a| self.is_copy(a, param_copy)),
                 _ => match self.impl_for("Copy", t) {
                     Some((id, map)) => self.impls[id].bounds.iter().all(|(gp, tr)| tr != "Copy" || self.is_copy(&map[gp], param_copy)),
                     None => false,
                 },
             },
+        }
+    }
+
+    /// Whether a value of `t` may hold a reference (and so carries loans).
+    pub fn contains_ref(&self, t: &Type) -> bool {
+        self.contains_ref_in(t, &mut Vec::new())
+    }
+
+    fn contains_ref_in(&self, t: &Type, visiting: &mut Vec<Type>) -> bool {
+        let Type::Con(n, args) = t else { return false };
+        if n == "&" || n == "&mut" {
+            return true;
+        }
+        if args.iter().any(|a| self.contains_ref_in(a, visiting)) {
+            return true;
+        }
+        if visiting.contains(t) {
+            return false;
+        }
+        visiting.push(t.clone());
+        let fields: Vec<Type> = if let Some(s) = self.structs.get(n) {
+            let map: HashMap<String, Type> = s.generics.iter().cloned().zip(args.iter().cloned()).collect();
+            s.fields.iter().map(|(_, f)| subst(f, &map)).collect()
+        } else if let Some(e) = self.enums.get(n) {
+            let map: HashMap<String, Type> = e.generics.iter().cloned().zip(args.iter().cloned()).collect();
+            e.variants.iter().flat_map(|v| v.fields.iter().map(|(_, f)| subst(f, &map))).collect::<Vec<_>>()
+        } else {
+            vec![]
+        };
+        let r = fields.iter().any(|f| self.contains_ref_in(f, visiting));
+        visiting.pop();
+        r
+    }
+
+    /// Lifetime elision: the parameter a returned reference borrows from. `Ok(None)` when the
+    /// result holds no reference; `Err` when elision cannot decide.
+    pub fn elide(&self, params: &[Type], has_self: bool, ret: &Type) -> Result<Option<usize>, ()> {
+        if !self.contains_ref(ret) {
+            return Ok(None);
+        }
+        if has_self && params[0].as_ref().is_some() {
+            return Ok(Some(0));
+        }
+        let with_refs: Vec<usize> = (0..params.len()).filter(|&i| self.contains_ref(&params[i])).collect();
+        match with_refs.as_slice() {
+            [i] => Ok(Some(*i)),
+            _ => Err(()),
         }
     }
 
