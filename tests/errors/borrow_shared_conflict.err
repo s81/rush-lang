@@ -1,0 +1,2 @@
+error: cannot borrow `p.name` as shared because it is mutably borrowed
+note: `p` is borrowed here

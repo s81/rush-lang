@@ -1,0 +1,8 @@
+struct Holder
+  s: &String
+end
+
+def main
+  let s = "a"
+  let g = Gc.new(Holder { s: &s })
+end

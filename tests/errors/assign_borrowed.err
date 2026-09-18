@@ -1,0 +1,2 @@
+error: cannot assign to `x` because it is borrowed
+note: `x` is borrowed here

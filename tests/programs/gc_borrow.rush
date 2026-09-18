@@ -1,0 +1,27 @@
+struct Counter
+  name: String
+  n: Int
+end
+
+def main
+  let g = Gc.new(Counter { name: "c", n: 1 })
+  let a = g.borrow
+  let b = g.borrow                   # two shared borrows at once
+  puts("#{a.n} #{b.n}")              # 1 1
+  let m = g.borrow_mut               # a and b are dead: their borrows were released
+  m.n += 1
+  let r = g.borrow
+  if r.n > 5
+    puts("big")
+  else
+    puts("small")                    # small
+  end
+  let w = g.borrow_mut               # r released on both branches
+  w.n = 7
+  let mut i = 0
+  while i < 2
+    let c = g.borrow
+    puts(&int_to_s(c.n))             # 7, 7
+    i += 1
+  end
+end

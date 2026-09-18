@@ -1,0 +1,1 @@
+error: cannot infer the lifetime of the returned reference; return an owned value instead

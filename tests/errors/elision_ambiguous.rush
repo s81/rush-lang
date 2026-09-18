@@ -1,0 +1,8 @@
+def longer(a: &String, b: &String) -> &String
+  a
+end
+
+def main
+  let x = "a"
+  puts(longer(&x, &x))
+end

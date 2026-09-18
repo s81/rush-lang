@@ -1,0 +1,17 @@
+in if
+drop inner2
+drop inner1
+after if
+drop loop 0
+drop loop 1
+after loop
+temp
+drop temp
+after temp
+drop re 1
+drop early b
+drop early a
+drop early a
+end of main
+drop re 2
+drop outer

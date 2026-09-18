@@ -31,8 +31,17 @@ fn programs_produce_expected_output() {
         let dir = path.parent().unwrap();
         let file = path.file_name().unwrap().to_str().unwrap();
         let out = rush(&["run", file], dir);
-        let stderr = String::from_utf8_lossy(&out.stderr);
-        assert!(out.status.success(), "{file}: rush run failed\n{stderr}");
+        let stderr = String::from_utf8_lossy(&out.stderr).replace("\r\n", "\n");
+        // A sibling .err file means the program panics: non-zero exit, stderr holds each line.
+        match std::fs::read_to_string(path.with_extension("err")) {
+            Ok(err) => {
+                assert!(!out.status.success(), "{file}: expected a panic\n{stderr}");
+                for line in err.lines().filter(|l| !l.trim().is_empty()) {
+                    assert!(stderr.contains(line.trim_end()), "{file}: stderr was:\n{stderr}\nexpected to contain:\n{line}");
+                }
+            }
+            Err(_) => assert!(out.status.success(), "{file}: rush run failed\n{stderr}"),
+        }
         let stdout = String::from_utf8_lossy(&out.stdout).replace("\r\n", "\n");
         assert_eq!(stdout, expected, "{file}: stdout mismatch");
     }

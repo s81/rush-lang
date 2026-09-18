@@ -1,0 +1,2 @@
+error: cannot borrow `x` as mutable because it is already borrowed
+note: `x` is borrowed here

@@ -1,0 +1,10 @@
+struct P
+  name: String
+end
+
+def main
+  let mut p = P { name: "a" }
+  let r = &mut p
+  puts(&p.name)
+  r.name = "b"
+end

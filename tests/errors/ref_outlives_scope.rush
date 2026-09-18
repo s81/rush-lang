@@ -1,0 +1,8 @@
+def main
+  let mut r = &"outer"
+  if true
+    let inner = "inner"
+    r = &inner
+  end
+  puts(r)
+end
