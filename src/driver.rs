@@ -1,7 +1,7 @@
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
-use crate::{cgen, derive, diag, lexer, mir, mono, ownck, parser, types};
+use crate::{borrowck, cgen, derive, diag, lexer, mir, mono, ownck, parser, types};
 
 const PRELUDE: &str = include_str!("../std/prelude.rush");
 const RT_C: &str = include_str!("../runtime/rush_rt.c");
@@ -28,6 +28,7 @@ pub fn compile_to_c(path: &str, src: &str, debug: bool) -> Result<String, String
         let info = types::check(&prog)?;
         let mut bodies = mir::lower(&prog, &info)?;
         ownck::check_and_insert_drops(&mut bodies, &info)?;
+        borrowck::check(&mut bodies, &info)?;
         let bodies = mono::monomorphize(bodies, &info)?;
         Ok(cgen::gen(&bodies, &info, debug))
     };

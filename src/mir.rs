@@ -471,6 +471,7 @@ impl<'a> Lowerer<'a> {
                         last = v;
                     } else {
                         // Temporaries of an expression statement die at its end.
+                        self.span = e.span;
                         let temps = self.owned.last_mut().unwrap().split_off(mark);
                         self.kill(&temps, &Operand::Const(Const::Unit));
                         last = Operand::Const(Const::Unit);
