@@ -932,6 +932,7 @@ impl<'a> Checker<'a> {
                 }
                 self.inf.fresh()
             }
+            ExprKind::Closure { .. } => return Err(Diagnostic::new(e.span, "closures are not supported yet")),
             ExprKind::Next => {
                 if self.loops.is_empty() {
                     return Err(Diagnostic::new(e.span, "`next` outside of a loop"));
@@ -1441,7 +1442,7 @@ fn collect_refs(e: &Expr, out: &mut Vec<String>) {
             collect_refs(cond, out);
             collect_refs_block(body, out);
         }
-        ExprKind::Loop(body) => collect_refs_block(body, out),
+        ExprKind::Loop(body) | ExprKind::Closure { body, .. } => collect_refs_block(body, out),
         ExprKind::For { iter, body, .. } => {
             collect_refs(iter, out);
             collect_refs_block(body, out);
@@ -1513,7 +1514,7 @@ fn collect_cases<'a>(e: &'a Expr, out: &mut Vec<(&'a Expr, &'a [Arm], Span)>) {
             collect_cases(cond, out);
             collect_cases_block(body, out);
         }
-        ExprKind::Loop(body) => collect_cases_block(body, out),
+        ExprKind::Loop(body) | ExprKind::Closure { body, .. } => collect_cases_block(body, out),
         ExprKind::For { iter, body, .. } => {
             collect_cases(iter, out);
             collect_cases_block(body, out);

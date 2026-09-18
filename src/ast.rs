@@ -136,6 +136,13 @@ impl TypeExpr {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+pub struct ClosureParam {
+    pub name: String,
+    pub ty: Option<TypeExpr>,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub struct Block {
     pub stmts: Vec<Stmt>,
     pub span: Span,
@@ -219,6 +226,8 @@ pub enum ExprKind {
     If { cond: Box<Expr>, then: Block, els: Option<Block> },
     While { cond: Box<Expr>, body: Block },
     Loop(Block),
+    /// `{ |params| body }` or `do |params| ... end`, optionally `move`.
+    Closure { params: Vec<ClosureParam>, body: Block, is_move: bool },
     /// `break` or `break e` (a value only in `loop`).
     Break(Option<Box<Expr>>),
     Next,

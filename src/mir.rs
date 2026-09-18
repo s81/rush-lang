@@ -1093,6 +1093,7 @@ impl<'a> Lowerer<'a> {
                 self.cur = self.new_block();
                 Operand::Const(Const::Unit)
             }
+            ExprKind::Closure { .. } => unreachable!("rejected by the type checker until Plan 4a Task 4"),
             ExprKind::Next => {
                 let ctx = self.loops.last().cloned().expect("checked: next inside a loop");
                 self.exit_scopes(ctx.depth);

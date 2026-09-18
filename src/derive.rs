@@ -292,6 +292,10 @@ fn respan_expr(e: &mut Expr, sp: Span) {
             respan_block(body, sp);
         }
         ExprKind::Loop(body) => respan_block(body, sp),
+        ExprKind::Closure { params, body, .. } => {
+            params.iter_mut().for_each(|p| p.span = sp);
+            respan_block(body, sp);
+        }
         ExprKind::For { iter, body, var_span, .. } => {
             *var_span = sp;
             respan_expr(iter, sp);
