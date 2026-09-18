@@ -122,7 +122,13 @@ impl<'a> Ck<'a> {
     /// Applies a statement to the state, reporting errors.
     fn step(&mut self, st: &mut State, s: &Statement) -> Result<(), Diagnostic> {
         match s {
-            Statement::Drop(..) | Statement::StorageDead(..) => Ok(()),
+            Statement::Drop(..) => Ok(()),
+            Statement::StorageDead(l, _) => {
+                if self.tracked[*l as usize] {
+                    st.set(*l as usize, St::Dead);
+                }
+                Ok(())
+            }
             Statement::Assign(target, rv, span) => {
                 match rv {
                     Rvalue::Use(op) => self.use_operand(st, op, *span)?,
@@ -214,11 +220,17 @@ fn check_body(body: &mut Body, info: &TypeInfo) -> Result<(), Diagnostic> {
             }
         }
     }
-    // Drop flags: one Bool per tracked local.
-    let tracked: Vec<LocalId> = (0..n as LocalId).filter(|&i| ck.tracked[i as usize]).collect();
+    // Drop flags: one Bool per tracked local whose drop may do something. In a generic body a
+    // type parameter may need drop once instantiated.
+    let droppable: Vec<LocalId> = (0..n as LocalId)
+        .filter(|&i| ck.tracked[i as usize] && {
+            let t = &body.locals[i as usize].ty;
+            t.has_param() || info.needs_drop(t)
+        })
+        .collect();
     let mut flag_of: HashMap<LocalId, LocalId> = HashMap::new();
     let mut locals = body.locals.clone();
-    for &l in &tracked {
+    for &l in &droppable {
         let f = locals.len() as LocalId;
         locals.push(Local { name: format!("{}_live", body.locals[l as usize].name), ty: Type::con("Bool") });
         flag_of.insert(l, f);
@@ -237,7 +249,7 @@ fn check_body(body: &mut Body, info: &TypeInfo) -> Result<(), Diagnostic> {
             Statement::Assign(_, _, sp) | Statement::Drop(_, sp) | Statement::StorageDead(_, sp) => *sp,
         }).unwrap_or_default();
         if bi == 0 {
-            for &l in &tracked {
+            for &l in &droppable {
                 let live = l as usize >= 1 && l as usize <= body.n_params;
                 em.cur.push(set_flag(l, live, entry_span));
             }
@@ -257,28 +269,40 @@ fn check_body(body: &mut Body, info: &TypeInfo) -> Result<(), Diagnostic> {
                             .collect(),
                         _ => vec![],
                     };
-                    let whole_tracked = target.proj.is_empty() && ck.tracked[target.local as usize];
+                    let whole_tracked = target.proj.is_empty() && flag_of.contains_key(&target.local);
                     let old_live = whole_tracked && (st.live[target.local as usize] || st.partial[target.local as usize]);
                     ck.step(&mut st, s)?;
                     if old_live {
                         em.guarded(flag_of[&target.local], vec![Statement::Drop(Place::local(target.local), *span)]);
                     }
                     em.cur.push(s.clone());
-                    for m in moved {
+                    for m in moved.into_iter().filter(|m| flag_of.contains_key(m)) {
                         em.cur.push(set_flag(m, false, *span));
                     }
                     if whole_tracked {
                         em.cur.push(set_flag(target.local, true, *span));
                     }
                 }
-                Statement::Drop(..) | Statement::StorageDead(..) => {
+                Statement::StorageDead(l, span) => {
+                    // Scope end: drop the value if this path may still own it.
+                    let li = *l as usize;
+                    let owned = flag_of.contains_key(l) && (st.live[li] || st.partial[li]);
+                    ck.step(&mut st, s)?;
+                    if owned {
+                        em.guarded(flag_of[l], vec![Statement::Drop(Place::local(*l), *span)]);
+                        em.cur.push(set_flag(*l, false, *span));
+                    }
+                    em.cur.push(s.clone());
+                }
+                Statement::Drop(..) => {
                     ck.step(&mut st, s)?;
                     em.cur.push(s.clone());
                 }
             }
         }
         if matches!(bb.term, Terminator::Return) {
-            for &l in &tracked {
+            // Whatever is still owned is dropped in reverse declaration order.
+            for &l in droppable.iter().rev() {
                 em.guarded(flag_of[&l], vec![Statement::Drop(Place::local(l), entry_span)]);
             }
         }
@@ -365,6 +389,26 @@ mod tests {
     fn borrow_does_not_move_and_destructuring_partial_move() {
         run("def main\n  let s = \"a\"\n  puts(&s)\n  puts(&s)\nend\n").unwrap();
         assert_eq!(err("def main\n  let t = (\"a\", \"b\")\n  let (a, b) = t\n  let u = t\n  ()\nend\n"), "use of moved value `t`");
+    }
+
+    #[test]
+    fn inner_scope_locals_drop_at_scope_end_and_returns_drop_in_reverse() {
+        let d = dump_fn("def main\n  if true\n    let s = int_to_s(1)\n    ()\n  end\n  puts(\"after\")\nend\n", "main");
+        // `s` is `_3`: the then-branch drops it (guarded by its flag) before joining the code
+        // that calls `puts`.
+        assert!(d.contains("  _8 = true\n  if _8 then bb4 else bb5\n"), "{d}");
+        assert!(d.contains("bb4:\n  drop(_3)\n  goto bb5\nbb5:\n  _8 = false\n  dead(_3)\n  dead(_2)\n  _1 = ()\n  goto bb3\n"), "{d}");
+        let f = dump_fn("def f(a: String, b: String) -> Unit\n  ()\nend\ndef main\n  ()\nend\n", "f");
+        assert!(f.find("drop(_2)").unwrap() < f.find("drop(_1)").unwrap(), "{f}");
+    }
+
+    #[test]
+    fn only_locals_whose_drop_does_something_get_flags() {
+        let bodies = run("def f(r: &mut Int, s: String) -> Unit\n  ()\nend\ndef main\n  ()\nend\n").unwrap();
+        let f = bodies.iter().find(|b| b.name == "f").unwrap();
+        assert!(!f.locals.iter().any(|l| l.name == "r_live"));
+        assert!(f.locals.iter().any(|l| l.name == "s_live"));
+        assert_eq!(err("def f(r: &mut Int) -> Unit\n  let a = r\n  let b = r\n  ()\nend\ndef main\n  ()\nend\n"), "use of moved value `r`");
     }
 
     #[test]
