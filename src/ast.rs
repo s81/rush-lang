@@ -218,6 +218,12 @@ pub enum ExprKind {
     Call(Box<Expr>, Vec<Expr>),
     If { cond: Box<Expr>, then: Block, els: Option<Block> },
     While { cond: Box<Expr>, body: Block },
+    Loop(Block),
+    /// `break` or `break e` (a value only in `loop`).
+    Break(Option<Box<Expr>>),
+    Next,
+    /// `for var in iter`; `var` may be `_`.
+    For { var: String, var_span: Span, iter: Box<Expr>, body: Block },
     Case { scrutinee: Box<Expr>, arms: Vec<Arm> },
     Interp(Vec<InterpPart>),
     Assign(Box<Expr>, Box<Expr>),

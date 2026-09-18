@@ -7,7 +7,7 @@ def next_color(c: Symbol) -> Symbol
   case c
   in :red then :green
   in :green then :yellow
-  in _ then :red
+  else :red
   end
 end
 

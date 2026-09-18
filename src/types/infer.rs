@@ -99,6 +99,8 @@ pub(super) struct Checker<'a> {
     pub param_bounds: HashMap<String, Vec<String>>,
     pub self_ty: Option<Type>,
     pub ret_ty: Type,
+    /// Enclosing loops, innermost last: `Some(value type)` for `loop`, `None` for `while`/`for`.
+    pub loops: Vec<Option<Type>>,
     pub pending: Vec<(Type, String, Span)>,
     // Generalization bookkeeping.
     pub gen_map: HashMap<u32, String>,
@@ -121,6 +123,7 @@ pub(super) fn check_program(prog: &Program) -> Result<TypeInfo, Diagnostic> {
         param_bounds: HashMap::new(),
         self_ty: None,
         ret_ty: Type::unit(),
+        loops: vec![],
         pending: vec![],
         gen_map: HashMap::new(),
         next_param: 0,
@@ -504,6 +507,7 @@ impl<'a> Checker<'a> {
             scope.insert(p.name.clone(), (t, false));
         }
         self.scopes = vec![scope];
+        self.loops.clear();
         self.ret_ty = ret.clone();
         let body_ty = self.block(&job.def.body)?;
         let body_ty = match job.def.body.stmts.last() {
@@ -883,8 +887,56 @@ impl<'a> Checker<'a> {
                 let ct = self.expr(cond)?;
                 let ct = self.value_of(cond, &ct);
                 self.inf.unify(&Type::con("Bool"), &ct, cond.span)?;
+                self.loops.push(None);
                 self.block(body)?;
+                self.loops.pop();
                 Type::unit()
+            }
+            ExprKind::Loop(body) => {
+                // A `loop` without `break` leaves its type unconstrained; it defaults to Unit.
+                let t = self.inf.fresh();
+                self.loops.push(Some(t.clone()));
+                self.block(body)?;
+                self.loops.pop();
+                t
+            }
+            ExprKind::For { var, iter, body, .. } => {
+                let it = self.expr(iter)?;
+                let range_int = Type::Con("Range".into(), vec![Type::con("Int")]);
+                if self.inf.unify(&range_int, &it, iter.span).is_err() {
+                    return Err(Diagnostic::new(iter.span, "`for` needs a `Range[Int]` in this version"));
+                }
+                let mut scope = HashMap::new();
+                if var != "_" {
+                    scope.insert(var.clone(), (Type::con("Int"), false));
+                }
+                self.scopes.push(scope);
+                self.loops.push(None);
+                self.block(body)?;
+                self.loops.pop();
+                self.scopes.pop();
+                Type::unit()
+            }
+            ExprKind::Break(v) => {
+                let Some(target) = self.loops.last().cloned() else {
+                    return Err(Diagnostic::new(e.span, "`break` outside of a loop"));
+                };
+                match (target, v) {
+                    (Some(t), Some(x)) => {
+                        let vt = self.expr(x)?;
+                        self.inf.unify(&t, &vt, x.span)?;
+                    }
+                    (Some(t), None) => self.inf.unify(&t, &Type::unit(), e.span)?,
+                    (None, Some(x)) => return Err(Diagnostic::new(x.span, "`break` with a value is only allowed in `loop`")),
+                    (None, None) => {}
+                }
+                self.inf.fresh()
+            }
+            ExprKind::Next => {
+                if self.loops.is_empty() {
+                    return Err(Diagnostic::new(e.span, "`next` outside of a loop"));
+                }
+                self.inf.fresh()
             }
             ExprKind::Case { scrutinee, arms } => {
                 let st = self.expr(scrutinee)?;
@@ -1389,6 +1441,12 @@ fn collect_refs(e: &Expr, out: &mut Vec<String>) {
             collect_refs(cond, out);
             collect_refs_block(body, out);
         }
+        ExprKind::Loop(body) => collect_refs_block(body, out),
+        ExprKind::For { iter, body, .. } => {
+            collect_refs(iter, out);
+            collect_refs_block(body, out);
+        }
+        ExprKind::Break(v) => v.iter().for_each(|x| collect_refs(x, out)),
         ExprKind::Case { scrutinee, arms } => {
             collect_refs(scrutinee, out);
             for a in arms {
@@ -1455,6 +1513,12 @@ fn collect_cases<'a>(e: &'a Expr, out: &mut Vec<(&'a Expr, &'a [Arm], Span)>) {
             collect_cases(cond, out);
             collect_cases_block(body, out);
         }
+        ExprKind::Loop(body) => collect_cases_block(body, out),
+        ExprKind::For { iter, body, .. } => {
+            collect_cases(iter, out);
+            collect_cases_block(body, out);
+        }
+        ExprKind::Break(v) => v.iter().for_each(|x| collect_cases(x, out)),
         ExprKind::Interp(parts) => parts.iter().for_each(|p| {
             if let InterpPart::Expr(x) = p {
                 collect_cases(x, out)
@@ -1804,5 +1868,54 @@ end
   ()
 end
 ").starts_with("non-exhaustive `case`"));
+    }
+
+    #[test]
+    fn loops_break_next_and_for() {
+        assert_eq!(scheme("def f
+  loop
+    break 5
+  end
+end
+def main
+  f
+  ()
+end
+", "f"), "[] [] Int");
+        assert_eq!(scheme("def h
+  let x = loop
+    return
+  end
+  x
+end
+def main
+  h
+end
+", "h"), "[] [] Unit");
+        assert_eq!(err("def main
+  break
+end
+"), "`break` outside of a loop");
+        assert_eq!(err("def main
+  next
+end
+"), "`next` outside of a loop");
+        assert_eq!(err("def main
+  while true
+    break 1
+  end
+end
+"), "`break` with a value is only allowed in `loop`");
+        assert_eq!(err("def main
+  for i in 3
+  end
+end
+"), "`for` needs a `Range[Int]` in this version");
+        assert_eq!(err("def main
+  for i in 1..3
+    i = 2
+  end
+end
+"), "cannot assign twice to immutable variable `i`");
     }
 }

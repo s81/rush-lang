@@ -271,6 +271,18 @@ struct Lowerer<'a> {
     or_sel: HashMap<PatId, LocalId>,
     /// Locals created in each open scope, in creation order; parallel to `scopes`.
     owned: Vec<Vec<LocalId>>,
+    /// Enclosing loops, innermost last.
+    loops: Vec<LoopCtx>,
+}
+
+#[derive(Clone)]
+struct LoopCtx {
+    break_bb: BlockId,
+    next_bb: BlockId,
+    /// Receives `break e` in a `loop`.
+    value: Option<LocalId>,
+    /// `owned.len()` outside the loop: scopes at this depth and deeper end on `break`/`next`.
+    depth: usize,
 }
 
 fn lower_def(global: &str, d: &Def, info: &TypeInfo) -> Result<Body, Diagnostic> {
@@ -291,6 +303,7 @@ fn lower_def(global: &str, d: &Def, info: &TypeInfo) -> Result<Body, Diagnostic>
         copy_params,
         or_sel: HashMap::new(),
         owned: vec![vec![]],
+        loops: vec![],
     };
     let mut params = params.into_iter();
     if d.self_param.is_some() {
@@ -353,6 +366,67 @@ impl<'a> Lowerer<'a> {
                 self.push(Statement::StorageDead(l, span));
             }
         }
+    }
+    /// Ends every scope from `depth` inward, innermost first, before a jump out of them.
+    fn exit_scopes(&mut self, depth: usize) {
+        for i in (depth..self.owned.len()).rev() {
+            let locals = self.owned[i].clone();
+            self.kill(&locals, &Operand::Const(Const::Unit));
+        }
+    }
+    /// A loop body's value is unused: its temp dies at the end of the body.
+    fn discard(&mut self, v: Operand) {
+        if let Operand::Place(p) = &v {
+            let owned = self.owned.last_mut().unwrap();
+            if p.proj.is_empty() && owned.last() == Some(&p.local) {
+                owned.pop();
+                self.kill(&[p.local], &Operand::Const(Const::Unit));
+            }
+        }
+    }
+    /// `for var in r` over a `Range[Int]`. The end test comes before the increment, so an
+    /// inclusive range ending at the largest Int does not overflow.
+    fn for_range(&mut self, var: &str, iter: &Expr, body: &Block) -> Result<(), Diagnostic> {
+        let (int, bool_) = (Type::con("Int"), Type::con("Bool"));
+        let it = self.expr(iter)?;
+        let r = self.as_place(it, self.ty(iter));
+        let i = self.eval_to_temp(int.clone(), Rvalue::Use(Operand::Place(r.field(0))));
+        let stop = self.eval_to_temp(int.clone(), Rvalue::Use(Operand::Place(r.field(1))));
+        let ex = self.eval_to_temp(bool_.clone(), Rvalue::Use(Operand::Place(r.field(2))));
+        let (head, body_bb, step, inc, exit) = (self.new_block(), self.new_block(), self.new_block(), self.new_block(), self.new_block());
+        self.terminate(Terminator::Goto(head));
+        self.cur = head;
+        let lt = self.eval_to_temp(bool_.clone(), Rvalue::Binary(BinOp::Lt, i.clone(), stop.clone()));
+        let le = self.eval_to_temp(bool_.clone(), Rvalue::Binary(BinOp::Le, i.clone(), stop.clone()));
+        let open = self.eval_to_temp(bool_.clone(), Rvalue::Binary(BinOp::And, ex.clone(), lt));
+        let not_ex = self.eval_to_temp(bool_.clone(), Rvalue::Unary(UnOp::Not, ex.clone()));
+        let closed = self.eval_to_temp(bool_.clone(), Rvalue::Binary(BinOp::And, not_ex, le));
+        let go = self.eval_to_temp(bool_.clone(), Rvalue::Binary(BinOp::Or, open, closed));
+        self.terminate(Terminator::If(go, body_bb, exit));
+        self.cur = body_bb;
+        self.loops.push(LoopCtx { break_bb: exit, next_bb: step, value: None, depth: self.owned.len() });
+        self.push_scope();
+        if var != "_" {
+            let id = self.new_local(var, int.clone());
+            self.assign(id, Rvalue::Use(i.clone()));
+            self.scopes.last_mut().unwrap().insert(var.to_string(), id);
+        }
+        let v = self.block(body)?;
+        self.discard(v);
+        self.pop_scope(Operand::Const(Const::Unit));
+        self.loops.pop();
+        self.terminate(Terminator::Goto(step));
+        self.cur = step;
+        let at_stop = self.eval_to_temp(bool_.clone(), Rvalue::Binary(BinOp::Eq, i.clone(), stop));
+        let not_ex = self.eval_to_temp(bool_.clone(), Rvalue::Unary(UnOp::Not, ex));
+        let last = self.eval_to_temp(bool_, Rvalue::Binary(BinOp::And, not_ex, at_stop));
+        self.terminate(Terminator::If(last, exit, inc));
+        self.cur = inc;
+        let Operand::Place(ip) = i.clone() else { unreachable!() };
+        self.assign_place(ip, Rvalue::Binary(BinOp::Add, i, Operand::Const(Const::Int(1))));
+        self.terminate(Terminator::Goto(head));
+        self.cur = exit;
+        Ok(())
     }
     /// A `&mut` place passed to a call is reborrowed (`&mut *r`) instead of moved.
     fn reborrow(&mut self, op: Operand, ty: &Type) -> Operand {
@@ -925,14 +999,10 @@ impl<'a> Lowerer<'a> {
                 let c = self.expr(cond)?;
                 self.terminate(Terminator::If(c, body_bb, exit));
                 self.cur = body_bb;
+                self.loops.push(LoopCtx { break_bb: exit, next_bb: head, value: None, depth: self.owned.len() });
                 let v = self.block(body)?;
-                if let Operand::Place(p) = &v {
-                    let owned = self.owned.last_mut().unwrap();
-                    if p.proj.is_empty() && owned.last() == Some(&p.local) {
-                        owned.pop();
-                        self.kill(&[p.local], &Operand::Const(Const::Unit));
-                    }
-                }
+                self.discard(v);
+                self.loops.pop();
                 self.terminate(Terminator::Goto(head));
                 self.cur = exit;
                 Operand::Const(Const::Unit)
@@ -990,6 +1060,44 @@ impl<'a> Lowerer<'a> {
                     }
                 }
                 self.assign_place(place, Rvalue::Use(v));
+                Operand::Const(Const::Unit)
+            }
+            ExprKind::Loop(body) => {
+                let t = self.temp(self.ty(e));
+                let (head, exit) = (self.new_block(), self.new_block());
+                self.terminate(Terminator::Goto(head));
+                self.cur = head;
+                self.loops.push(LoopCtx { break_bb: exit, next_bb: head, value: Some(t), depth: self.owned.len() });
+                let v = self.block(body)?;
+                self.discard(v);
+                self.loops.pop();
+                self.terminate(Terminator::Goto(head));
+                self.cur = exit;
+                Operand::local(t)
+            }
+            ExprKind::For { var, iter, body, .. } => {
+                self.for_range(var, iter, body)?;
+                Operand::Const(Const::Unit)
+            }
+            ExprKind::Break(v) => {
+                let ctx = self.loops.last().cloned().expect("checked: break inside a loop");
+                if let Some(t) = ctx.value {
+                    let val = match v {
+                        Some(x) => self.expr(x)?,
+                        None => Operand::Const(Const::Unit),
+                    };
+                    self.assign(t, Rvalue::Use(val));
+                }
+                self.exit_scopes(ctx.depth);
+                self.terminate(Terminator::Goto(ctx.break_bb));
+                self.cur = self.new_block();
+                Operand::Const(Const::Unit)
+            }
+            ExprKind::Next => {
+                let ctx = self.loops.last().cloned().expect("checked: next inside a loop");
+                self.exit_scopes(ctx.depth);
+                self.terminate(Terminator::Goto(ctx.next_bb));
+                self.cur = self.new_block();
                 Operand::Const(Const::Unit)
             }
             ExprKind::Return(v) => {
@@ -1421,5 +1529,46 @@ mod tests {
         assert!(d.contains("call Gc::new[P](_2)"), "{d}");
         assert!(d.contains("call Gc::borrow[P](_"), "{d}");
         assert!(d.contains("= &(*_"), "{d}");
+    }
+
+    #[test]
+    fn break_ends_inner_scopes_first_and_next_goes_to_the_step() {
+        let f = dump_fn(&format!("def f -> Int
+  loop
+    let a = 1
+    if true
+      let b = 2
+      break b
+    end
+  end
+end
+{MAIN}"), "f");
+        // b, then the `if` temp, then a; then the loop's exit.
+        assert!(f.contains("bb3:
+  _4 = 2
+  _1 = _4
+  dead(_4)
+  dead(_3)
+  dead(_2)
+  goto bb2
+"), "{f}");
+        assert!(f.contains("bb2:
+  _0 = _1
+  return
+"), "{f}");
+        let g = dump_fn(&format!("def g
+  for i in 1..3
+    next
+  end
+end
+{MAIN}"), "g");
+        assert!(g.contains("bb2:
+  _11 = _2
+  dead(_11)
+  goto bb3
+"), "{g}");
+        assert!(g.contains("bb3:
+  _12 = Eq _2 _3
+"), "{g}");
     }
 }

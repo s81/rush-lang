@@ -921,6 +921,36 @@ impl Parser {
                 let end = self.expect_kw("end")?;
                 Ok(self.mk(ExprKind::While { cond: Box::new(cond), body }, sp.to(end)))
             }
+            Tok::Kw("loop") => {
+                self.bump();
+                self.expect_newline()?;
+                let body = self.block_until(&["end"])?;
+                let end = self.expect_kw("end")?;
+                Ok(self.mk(ExprKind::Loop(body), sp.to(end)))
+            }
+            Tok::Kw("for") => {
+                self.bump();
+                let (var, var_span) = self.expect_ident()?;
+                self.expect_kw("in")?;
+                let iter = self.expr()?;
+                self.expect_newline()?;
+                let body = self.block_until(&["end"])?;
+                let end = self.expect_kw("end")?;
+                Ok(self.mk(ExprKind::For { var, var_span, iter: Box::new(iter), body }, sp.to(end)))
+            }
+            Tok::Kw("break") => {
+                self.bump();
+                if matches!(self.peek(), Tok::Newline | Tok::Eof) || self.is_kw("end") {
+                    return Ok(self.mk(ExprKind::Break(None), sp));
+                }
+                let v = self.expr()?;
+                let span = sp.to(v.span);
+                Ok(self.mk(ExprKind::Break(Some(Box::new(v))), span))
+            }
+            Tok::Kw("next") => {
+                self.bump();
+                Ok(self.mk(ExprKind::Next, sp))
+            }
             _ => Err(self.err("expression")),
         }
     }
@@ -992,8 +1022,15 @@ impl Parser {
                 arms.push(Arm { pat, guard, body, span: arm_start.to(self.prev_span()) });
             } else if self.is_kw("else") {
                 let arm_start = self.bump().span;
-                self.expect_newline()?;
-                let body = self.block_until(&["end"])?;
+                // `else e` on one line, or a block on the following lines.
+                let body = if matches!(self.peek(), Tok::Newline) {
+                    self.block_until(&["end"])?
+                } else {
+                    let e = self.expr()?;
+                    let span = e.span;
+                    self.expect_newline()?;
+                    Block { stmts: vec![Stmt::Expr(e)], span }
+                };
                 let pat = self.mk_pat(PatKind::Wild, arm_start);
                 arms.push(Arm { pat, guard: None, body, span: arm_start.to(self.prev_span()) });
             } else if self.is_kw("end") {
@@ -1095,6 +1132,39 @@ mod tests {
   end");
         let ExprKind::Case { arms, .. } = &e.kind else { panic!() };
         assert!(matches!(&arms[0].pat.kind, PatKind::Lit(Lit::Symbol(s)) if s == "a"));
+    }
+
+    #[test]
+    fn loops_break_next_and_for() {
+        let e = main_expr("loop
+    break 5
+  end");
+        let ExprKind::Loop(b) = &e.kind else { panic!("{:?}", e.kind) };
+        assert!(matches!(&b.stmts[0], Stmt::Expr(x) if matches!(&x.kind, ExprKind::Break(Some(_)))));
+        let e = main_expr("while true
+    next
+    break
+  end");
+        let ExprKind::While { body, .. } = &e.kind else { panic!() };
+        assert!(matches!(&body.stmts[0], Stmt::Expr(x) if matches!(x.kind, ExprKind::Next)));
+        assert!(matches!(&body.stmts[1], Stmt::Expr(x) if matches!(x.kind, ExprKind::Break(None))));
+        let e = main_expr("for i in 1...n
+    i
+  end");
+        let ExprKind::For { var, iter, .. } = &e.kind else { panic!() };
+        assert_eq!(var, "i");
+        assert!(matches!(iter.kind, ExprKind::Range(_, _, true)));
+    }
+
+    #[test]
+    fn case_else_on_one_line() {
+        let e = main_expr("case x
+  in 1 then 2
+  else 3
+  end");
+        let ExprKind::Case { arms, .. } = &e.kind else { panic!() };
+        assert!(matches!(arms[1].pat.kind, PatKind::Wild));
+        assert!(matches!(&arms[1].body.stmts[0], Stmt::Expr(x) if matches!(x.kind, ExprKind::Int(3))));
     }
 
     #[test]
