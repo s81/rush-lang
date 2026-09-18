@@ -151,6 +151,7 @@ fn lit_type(l: &Lit) -> Type {
         Lit::Int(_) => Type::con("Int"),
         Lit::Float(_) => Type::con("Float"),
         Lit::Str(_) => Type::con("String"),
+        Lit::Symbol(_) => Type::con("Symbol"),
         Lit::Bool(_) => Type::con("Bool"),
         Lit::Unit => Type::unit(),
     }
@@ -742,6 +743,13 @@ impl<'a> Checker<'a> {
             ExprKind::Int(_) => Type::con("Int"),
             ExprKind::Float(_) => Type::con("Float"),
             ExprKind::Str(_) => Type::con("String"),
+            ExprKind::Symbol(_) => Type::con("Symbol"),
+            ExprKind::Range(a, b, _) => {
+                let ta = self.expr(a)?;
+                let tb = self.expr(b)?;
+                self.inf.unify(&ta, &tb, b.span)?;
+                Type::Con("Range".into(), vec![ta])
+            }
             ExprKind::Bool(_) => Type::con("Bool"),
             ExprKind::Unit => Type::unit(),
             ExprKind::Var(n) => match self.lookup(n) {
@@ -1362,7 +1370,7 @@ fn collect_refs(e: &Expr, out: &mut Vec<String>) {
             args.iter().flatten().for_each(|a| collect_refs(a, out));
         }
         ExprKind::TupleIndex(r, _) | ExprKind::Ref(_, r) | ExprKind::Deref(r) | ExprKind::Unary(_, r) => collect_refs(r, out),
-        ExprKind::Binary(_, a, b) | ExprKind::Assign(a, b) => {
+        ExprKind::Binary(_, a, b) | ExprKind::Assign(a, b) | ExprKind::Range(a, b, _) => {
             collect_refs(a, out);
             collect_refs(b, out);
         }
@@ -1428,7 +1436,7 @@ fn collect_cases<'a>(e: &'a Expr, out: &mut Vec<(&'a Expr, &'a [Arm], Span)>) {
             args.iter().flatten().for_each(|a| collect_cases(a, out));
         }
         ExprKind::TupleIndex(r, _) | ExprKind::Ref(_, r) | ExprKind::Deref(r) | ExprKind::Unary(_, r) => collect_cases(r, out),
-        ExprKind::Binary(_, a, b) | ExprKind::Assign(a, b) => {
+        ExprKind::Binary(_, a, b) | ExprKind::Assign(a, b) | ExprKind::Range(a, b, _) => {
             collect_cases(a, out);
             collect_cases(b, out);
         }
@@ -1771,5 +1779,30 @@ mod tests {
     fn derived_impls_typecheck() {
         let src = format!("{PERSON}enum S\n  derive Show, Eq, Clone\n  C(Float)\n  R {{ w: Float, h: String }}\n  E\nend\ndef main\n  let p = Person {{ name: \"a\", age: 1 }}\n  let q = p.clone\n  puts(\"#{{p == q}} #{{p}} #{{R {{ w: 1.0, h: \"x\" }}}} #{{C(1.0) == E}}\")\nend\n");
         check_src(&src).unwrap();
+    }
+
+    #[test]
+    fn symbols_and_ranges() {
+        let info = check_src("def main
+  let s = :a
+  let r = 1..3
+  ()
+end
+").unwrap();
+        let types: Vec<String> = info.expr_types.values().map(|t| t.to_string()).collect();
+        assert!(types.iter().any(|t| t == "Symbol"), "{types:?}");
+        assert!(types.iter().any(|t| t == "Range[Int]"), "{types:?}");
+        assert_eq!(err("def main
+  let r = 1..\"a\"
+end
+"), "type mismatch: expected Int, found String");
+        assert!(err("def main
+  case :a
+  in :a then 1
+  in :b then 2
+  end
+  ()
+end
+").starts_with("non-exhaustive `case`"));
     }
 }

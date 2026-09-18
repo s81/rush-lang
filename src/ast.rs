@@ -175,6 +175,7 @@ pub enum Lit {
     Str(String),
     Bool(bool),
     Unit,
+    Symbol(String),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -199,6 +200,9 @@ pub enum ExprKind {
     Str(String),
     Bool(bool),
     Unit,
+    Symbol(String),
+    /// `a..b` (inclusive) or `a...b` (exclusive, the flag).
+    Range(Box<Expr>, Box<Expr>, bool),
     Var(String),
     Tuple(Vec<Expr>),
     StructLit { name: String, fields: Vec<(String, Expr)> },

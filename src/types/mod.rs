@@ -84,7 +84,7 @@ impl Type {
         }
     }
     pub fn is_primitive(&self) -> bool {
-        matches!(self.head(), Some("Int" | "Float" | "Bool" | "String" | "Unit"))
+        matches!(self.head(), Some("Int" | "Float" | "Bool" | "String" | "Unit" | "Symbol"))
     }
     pub fn has_var(&self) -> bool {
         match self {
@@ -340,7 +340,7 @@ impl TypeInfo {
             Type::Param(p) => param_copy(p),
             Type::Fn(..) => true,
             Type::Con(n, args) => match n.as_str() {
-                "Int" | "Float" | "Bool" | "Unit" | "&" | "Gc" => true,
+                "Int" | "Float" | "Bool" | "Unit" | "Symbol" | "&" | "Gc" => true,
                 "String" | "&mut" => false,
                 "Tuple" => args.iter().all(|a| self.is_copy(a, param_copy)),
                 _ => match self.impl_for("Copy", t) {
@@ -403,7 +403,7 @@ impl TypeInfo {
         match t {
             Type::Con(n, args) => match n.as_str() {
                 "String" => true,
-                "Int" | "Float" | "Bool" | "Unit" | "&" | "&mut" | "Gc" => false,
+                "Int" | "Float" | "Bool" | "Unit" | "Symbol" | "&" | "&mut" | "Gc" => false,
                 "Tuple" => args.iter().any(|a| self.needs_drop(a)),
                 _ => {
                     if self.impl_for("Drop", t).is_some() {
@@ -450,7 +450,7 @@ pub struct TypeEnv<'a> {
     pub self_ty: Option<&'a Type>,
 }
 
-const BUILTIN_TYPES: &[&str] = &["Int", "Float", "Bool", "String", "Unit"];
+pub const BUILTIN_TYPES: &[&str] = &["Int", "Float", "Bool", "String", "Unit", "Symbol"];
 
 pub fn from_ast(t: &TypeExpr, env: &TypeEnv) -> Result<Type, Diagnostic> {
     match t {

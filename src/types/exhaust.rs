@@ -32,7 +32,8 @@ fn convert(info: &TypeInfo, p: &Pattern) -> P {
             match l {
                 Lit::Int(v) => C::Int(*v),
                 Lit::Float(v) => C::Float(v.to_bits()),
-                Lit::Str(s) => C::Str(s.clone()),
+                // A column holds one type, so strings and symbols never meet.
+                Lit::Str(s) | Lit::Symbol(s) => C::Str(s.clone()),
                 Lit::Bool(b) => C::Bool(*b),
                 Lit::Unit => C::Unit,
             },

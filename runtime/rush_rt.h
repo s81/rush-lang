@@ -43,6 +43,7 @@ rush_str rush_int_to_s(int64_t v);
 rush_str rush_float_to_s(double v);
 rush_str rush_bool_to_s(bool v);
 rush_str rush_str_concat(const rush_str *a, const rush_str *b);
+rush_str rush_sym_to_s(const char *s);
 rush_unit rush_gc_collect_now(void);
 int64_t rush_gc_live(void);
 

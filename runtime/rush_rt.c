@@ -70,6 +70,15 @@ bool rush_str_eq(rush_str a, rush_str b) {
     return a.len == b.len && memcmp(a.ptr, b.ptr, a.len) == 0;
 }
 
+/* Symbols are static C strings; the returned string borrows the storage (cap 0). */
+rush_str rush_sym_to_s(const char *s) {
+    rush_str r;
+    r.ptr = (uint8_t *)s;
+    r.len = strlen(s);
+    r.cap = 0;
+    return r;
+}
+
 rush_str rush_str_concat(const rush_str *a, const rush_str *b) {
     size_t len = a->len + b->len;
     uint8_t *p = (uint8_t *)malloc(len ? len : 1);

@@ -21,6 +21,7 @@ fn describe(t: &Tok) -> String {
         Tok::Str(s) => format!("string {s:?}"),
         Tok::Interp(_) => "interpolated string".to_string(),
         Tok::Ident(s) => format!("`{s}`"),
+        Tok::Sym(s) => format!("`:{s}`"),
         Tok::Kw(k) => format!("`{k}`"),
         Tok::Op(o) => format!("`{o}`"),
         Tok::Newline => "end of line".to_string(),
@@ -527,6 +528,10 @@ impl Parser {
                 self.bump();
                 Ok(self.mk_pat(PatKind::Lit(Lit::Str(s)), sp))
             }
+            Tok::Sym(s) => {
+                self.bump();
+                Ok(self.mk_pat(PatKind::Lit(Lit::Symbol(s)), sp))
+            }
             Tok::Kw("true") => {
                 self.bump();
                 Ok(self.mk_pat(PatKind::Lit(Lit::Bool(true)), sp))
@@ -636,7 +641,7 @@ impl Parser {
             let end = val.as_ref().map(|e| e.span).unwrap_or(sp);
             return Ok(self.mk(ExprKind::Return(val), sp.to(end)));
         }
-        let lhs = self.binary(0)?;
+        let lhs = self.range()?;
         let compound: [(&str, Option<BinOp>); 5] = [
             ("=", None),
             ("+=", Some(BinOp::Add)),
@@ -660,6 +665,20 @@ impl Parser {
             }
         }
         Ok(lhs)
+    }
+
+    /// `a..b` and `a...b` bind more loosely than every binary operator and do not chain.
+    fn range(&mut self) -> Result<Expr, Diagnostic> {
+        let lhs = self.binary(0)?;
+        let exclusive = match self.peek() {
+            Tok::Op("..") => false,
+            Tok::Op("...") => true,
+            _ => return Ok(lhs),
+        };
+        self.bump();
+        let rhs = self.binary(0)?;
+        let span = lhs.span.to(rhs.span);
+        Ok(self.mk(ExprKind::Range(Box::new(lhs), Box::new(rhs), exclusive), span))
     }
 
     /// Fresh copy of an assignment target, for desugaring `x += e` and `p.x += e`.
@@ -809,6 +828,10 @@ impl Parser {
             Tok::Str(s) => {
                 self.bump();
                 Ok(self.mk(ExprKind::Str(s), sp))
+            }
+            Tok::Sym(s) => {
+                self.bump();
+                Ok(self.mk(ExprKind::Symbol(s), sp))
             }
             Tok::Interp(parts) => {
                 self.bump();
@@ -1052,6 +1075,26 @@ mod tests {
         let e = main_expr("a + 1 < b and c");
         let ExprKind::Binary(BinOp::And, l, _) = &e.kind else { panic!() };
         assert!(matches!(l.kind, ExprKind::Binary(BinOp::Lt, _, _)));
+    }
+
+    #[test]
+    fn ranges_bind_looser_than_arithmetic() {
+        let e = main_expr("1..n - 1");
+        let ExprKind::Range(l, r, false) = &e.kind else { panic!("{:?}", e.kind) };
+        assert!(matches!(l.kind, ExprKind::Int(1)));
+        assert!(matches!(r.kind, ExprKind::Binary(BinOp::Sub, _, _)));
+        assert!(matches!(main_expr("a...b").kind, ExprKind::Range(_, _, true)));
+    }
+
+    #[test]
+    fn symbol_literals_and_patterns() {
+        assert!(matches!(&main_expr(":ok").kind, ExprKind::Symbol(s) if s == "ok"));
+        let e = main_expr("case x
+  in :a then 1
+  in _ then 2
+  end");
+        let ExprKind::Case { arms, .. } = &e.kind else { panic!() };
+        assert!(matches!(&arms[0].pat.kind, PatKind::Lit(Lit::Symbol(s)) if s == "a"));
     }
 
     #[test]

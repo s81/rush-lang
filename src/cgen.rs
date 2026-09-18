@@ -17,6 +17,7 @@ fn c_type(t: &Type) -> String {
             "Bool" => "bool".into(),
             "String" => "rush_str".into(),
             "Unit" => "rush_unit".into(),
+            "Symbol" => "const char *".into(),
             _ => format!("rush_{}", mangle_type(t)),
         },
         Type::Con(..) => format!("rush_{}", mangle_type(t)),
@@ -48,6 +49,36 @@ fn c_string_lit(s: &str) -> String {
 struct Gen<'a> {
     info: &'a TypeInfo,
     debug: bool,
+    /// Symbol name -> index of its `rush_sym_<n>` static; equal symbols share one address.
+    syms: HashMap<String, usize>,
+}
+
+/// Every distinct symbol constant in `bodies`, sorted.
+fn symbols(bodies: &[Body]) -> Vec<String> {
+    let mut out = std::collections::BTreeSet::new();
+    let mut add = |o: &Operand| {
+        if let Operand::Const(Const::Symbol(s)) = o {
+            out.insert(s.clone());
+        }
+    };
+    for bb in bodies.iter().flat_map(|b| &b.blocks) {
+        for s in &bb.stmts {
+            let Statement::Assign(_, rv, _) = s else { continue };
+            match rv {
+                Rvalue::Use(o) | Rvalue::Unary(_, o) => add(o),
+                Rvalue::Binary(_, a, b) => {
+                    add(a);
+                    add(b);
+                }
+                Rvalue::Call(_, ops) | Rvalue::Aggregate(_, ops) => ops.iter().for_each(&mut add),
+                Rvalue::MoveOut(_) | Rvalue::Ref(..) | Rvalue::Discriminant(_) => {}
+            }
+        }
+        if let Terminator::If(o, ..) = &bb.term {
+            add(o);
+        }
+    }
+    out.into_iter().collect()
 }
 
 impl<'a> Gen<'a> {
@@ -322,6 +353,7 @@ impl<'a> Gen<'a> {
             }
             Operand::Const(Const::Bool(v)) => (v.to_string(), Type::con("Bool")),
             Operand::Const(Const::Str(s)) => (format!("rush_str_lit({}, {})", c_string_lit(s), s.len()), Type::con("String")),
+            Operand::Const(Const::Symbol(s)) => (format!("rush_sym_{}", self.syms[s]), Type::con("Symbol")),
             Operand::Const(Const::Unit) => ("RUSH_UNIT".to_string(), Type::unit()),
         }
     }
@@ -479,9 +511,13 @@ fn strip_pointers(t: &Type) -> Type {
 }
 
 pub fn gen(bodies: &[Body], info: &TypeInfo, debug: bool) -> String {
-    let g = Gen { info, debug };
+    let syms = symbols(bodies);
+    let g = Gen { info, debug, syms: syms.iter().enumerate().map(|(i, s)| (s.clone(), i)).collect() };
     let mut c = String::new();
     c.push_str("#include \"rush_rt.h\"\n#include <math.h>\n#include <stdlib.h>\n\n");
+    for (i, s) in syms.iter().enumerate() {
+        writeln!(c, "static const char rush_sym_{i}[] = {};", c_string_lit(s)).unwrap();
+    }
     let order = g.all_types(bodies);
     c.push_str(&g.type_defs(&order));
     for b in bodies {
@@ -595,5 +631,17 @@ mod tests {
         assert!(c.contains("rush_mul_i64_checked("), "{c}");
         let c2 = gen_src("def main\n  let n = 1 + 2\n  ()\nend\n");
         assert!(!c2.contains("checked"), "{c2}");
+    }
+
+    #[test]
+    fn one_static_per_distinct_symbol() {
+        let c = gen_src("def main
+  let a = :x == :x
+  let b = :y
+  ()
+end
+");
+        assert_eq!(c.matches("static const char rush_sym_").count(), 2, "{c}");
+        assert!(c.contains("rush_sym_0 == rush_sym_0"), "{c}");
     }
 }

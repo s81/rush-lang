@@ -1,0 +1,21 @@
+struct Light
+  derive Show
+  color: Symbol
+end
+
+def next_color(c: Symbol) -> Symbol
+  case c
+  in :red then :green
+  in :green then :yellow
+  in _ then :red
+  end
+end
+
+def main
+  puts("#{:a} #{:a.inspect} #{:a == :a} #{:a == :b} #{1..3} #{1...3}")
+  let l = Light { color: next_color(:red) }
+  puts("#{l}")
+  puts("#{next_color(:yellow)} #{:ok? == :ok?}")
+  let r = 2...5
+  puts("#{r.start} #{r.stop} #{r.exclusive}")
+end

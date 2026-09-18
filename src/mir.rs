@@ -121,6 +121,7 @@ pub enum Const {
     Float(f64),
     Bool(bool),
     Str(String),
+    Symbol(String),
     Unit,
 }
 
@@ -694,6 +695,13 @@ impl<'a> Lowerer<'a> {
             ExprKind::Int(v) => Operand::Const(Const::Int(*v)),
             ExprKind::Float(v) => Operand::Const(Const::Float(*v)),
             ExprKind::Str(s) => Operand::Const(Const::Str(s.clone())),
+            ExprKind::Symbol(s) => Operand::Const(Const::Symbol(s.clone())),
+            ExprKind::Range(a, b, exclusive) => {
+                let va = self.expr(a)?;
+                let vb = self.expr(b)?;
+                let ty = self.ty(e);
+                self.eval_to_temp(ty.clone(), Rvalue::Aggregate(Agg::Struct(ty), vec![va, vb, Operand::Const(Const::Bool(*exclusive))]))
+            }
             ExprKind::Bool(b) => Operand::Const(Const::Bool(*b)),
             ExprKind::Unit => Operand::Const(Const::Unit),
             ExprKind::Var(n) => match self.lookup(n) {
@@ -1072,6 +1080,7 @@ impl<'a> Lowerer<'a> {
                     Lit::Int(v) => Const::Int(*v),
                     Lit::Float(v) => Const::Float(*v),
                     Lit::Str(s) => Const::Str(s.clone()),
+                    Lit::Symbol(s) => Const::Symbol(s.clone()),
                     Lit::Bool(b) => Const::Bool(*b),
                     Lit::Unit => return,
                 };
@@ -1168,6 +1177,7 @@ fn fmt_operand(o: &Operand) -> String {
         Operand::Const(Const::Float(v)) => format!("{v:?}"),
         Operand::Const(Const::Bool(v)) => v.to_string(),
         Operand::Const(Const::Str(s)) => format!("{s:?}"),
+        Operand::Const(Const::Symbol(s)) => format!(":{s}"),
         Operand::Const(Const::Unit) => "()".to_string(),
     }
 }
