@@ -1,0 +1,8 @@
+struct Person
+  derive Copy
+  name: String
+end
+
+def main
+  ()
+end

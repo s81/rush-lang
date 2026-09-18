@@ -64,7 +64,7 @@ struct Sig {
 }
 
 fn signature(info: &TypeInfo, ty: &Type) -> Sig {
-    match ty {
+    match ty.peel() {
         Type::Con(n, items) => match n.as_str() {
             "Bool" => Sig { ctors: Some(vec![C::Bool(true), C::Bool(false)]) },
             "Unit" => Sig { ctors: Some(vec![C::Unit]) },
@@ -82,7 +82,7 @@ fn signature(info: &TypeInfo, ty: &Type) -> Sig {
 
 /// Field types of constructor `c` at type `ty`.
 fn fields_of(info: &TypeInfo, ty: &Type, c: &C) -> Vec<Type> {
-    match (ty, c) {
+    match (ty.peel(), c) {
         (Type::Con(_, items), C::Tuple) => items.clone(),
         (Type::Con(n, targs), C::Struct) => {
             let s = &info.structs[n];
@@ -203,6 +203,7 @@ fn useful(info: &TypeInfo, rows: &[Vec<P>], q: &[P], tys: &[Type]) -> Option<Vec
 }
 
 fn show(info: &TypeInfo, ty: &Type, p: &P) -> String {
+    let ty = ty.peel();
     match p {
         P::Wild => "_".into(),
         P::Or(alts) => alts.iter().map(|a| show(info, ty, a)).collect::<Vec<_>>().join(" | "),

@@ -251,6 +251,7 @@ impl Parser {
         let (name, _) = self.expect_ident()?;
         let generics = self.generics()?;
         self.expect_newline()?;
+        let derives = self.derives()?;
         let mut fields = Vec::new();
         while !self.is_kw("end") {
             if self.at_eof() {
@@ -260,7 +261,22 @@ impl Parser {
             self.expect_newline()?;
         }
         let end = self.expect_kw("end")?;
-        Ok(StructDef { name, generics, fields, span: start.to(end) })
+        Ok(StructDef { name, generics, derives, fields, span: start.to(end) })
+    }
+
+    /// `derive A, B` as the first line of a struct or enum body.
+    fn derives(&mut self) -> Result<Vec<String>, Diagnostic> {
+        let mut out = Vec::new();
+        if self.eat_kw("derive") {
+            loop {
+                out.push(self.expect_ident()?.0);
+                if !self.eat_op(",") {
+                    break;
+                }
+            }
+            self.expect_newline()?;
+        }
+        Ok(out)
     }
 
     fn field_def(&mut self) -> Result<FieldDef, Diagnostic> {
@@ -275,6 +291,7 @@ impl Parser {
         let (name, _) = self.expect_ident()?;
         let generics = self.generics()?;
         self.expect_newline()?;
+        let derives = self.derives()?;
         let mut variants = Vec::new();
         while !self.is_kw("end") {
             if self.at_eof() {
@@ -314,7 +331,7 @@ impl Parser {
             self.expect_newline()?;
         }
         let end = self.expect_kw("end")?;
-        Ok(EnumDef { name, generics, variants, span: start.to(end) })
+        Ok(EnumDef { name, generics, derives, variants, span: start.to(end) })
     }
 
     fn trait_def(&mut self) -> Result<TraitDef, Diagnostic> {
@@ -711,13 +728,18 @@ impl Parser {
             let span = sp.to(e.span);
             return Ok(self.mk(ExprKind::Unary(UnOp::Not, Box::new(e)), span));
         }
-        // Borrow and deref are erased until Plan 3.
-        if self.eat_op("&") {
-            self.eat_kw("mut");
-            return self.unary();
+        if self.is_op("&") {
+            let sp = self.bump().span;
+            let mutable = self.eat_kw("mut");
+            let e = self.unary()?;
+            let span = sp.to(e.span);
+            return Ok(self.mk(ExprKind::Ref(mutable, Box::new(e)), span));
         }
-        if self.eat_op("*") {
-            return self.unary();
+        if self.is_op("*") {
+            let sp = self.bump().span;
+            let e = self.unary()?;
+            let span = sp.to(e.span);
+            return Ok(self.mk(ExprKind::Deref(Box::new(e)), span));
         }
         self.postfix()
     }
@@ -1252,10 +1274,38 @@ mod tests {
     }
 
     #[test]
-    fn refs_are_erased() {
-        assert!(matches!(main_expr("&x").kind, ExprKind::Var(_)));
-        assert!(matches!(main_expr("&mut x").kind, ExprKind::Var(_)));
-        assert!(matches!(main_expr("*x").kind, ExprKind::Var(_)));
+    fn refs_parse() {
+        assert!(matches!(main_expr("&x").kind, ExprKind::Ref(false, _)));
+        assert!(matches!(main_expr("&mut x").kind, ExprKind::Ref(true, _)));
+        assert!(matches!(main_expr("*x").kind, ExprKind::Deref(_)));
+        let e = main_expr("&p.x");
+        let ExprKind::Ref(false, inner) = &e.kind else { panic!() };
+        assert!(matches!(inner.kind, ExprKind::Dot { .. }));
+    }
+
+    #[test]
+    fn derive_lines_and_paths() {
+        let p = parse_src("struct P
+  derive Show, Eq
+  x: Int
+end
+enum E
+  derive Copy
+  A
+end
+").unwrap();
+        let Item::Struct(s) = &p.items[0] else { panic!() };
+        assert_eq!(s.derives, vec!["Show", "Eq"]);
+        assert_eq!(s.fields.len(), 1);
+        let Item::Enum(e) = &p.items[1] else { panic!() };
+        assert_eq!(e.derives, vec!["Copy"]);
+        // `Type.name(args)` is an ordinary Dot; the checker resolves associated functions.
+        let e = main_expr("Gc.new(1)");
+        let ExprKind::Dot { recv, name, args: Some(args) } = &e.kind else { panic!("{:?}", e.kind) };
+        assert!(matches!(&recv.kind, ExprKind::Var(t) if t == "Gc"));
+        assert_eq!(name, "new");
+        assert_eq!(args.len(), 1);
+        assert!(matches!(main_expr("Point { x: 1.0 }").kind, ExprKind::StructLit { .. }));
     }
 
     #[test]

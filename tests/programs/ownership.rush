@@ -1,0 +1,31 @@
+struct Person
+  derive Show, Eq, Clone
+  name: String
+  age: Int
+end
+
+impl Person
+  def birthday(&mut self)
+    @age += 1
+  end
+  def greet(&self) -> String
+    "hi #{@name}"
+  end
+  def anonymous(age: Int) -> Person
+    Person { name: "anon", age: age }
+  end
+end
+
+def shout(p: &Person) -> String
+  p.greet + "!"
+end
+
+def main
+  let mut p = Person { name: "Ann", age: 30 }
+  p.birthday
+  puts(&shout(&p))
+  let q = p.clone
+  let r = p
+  puts("#{q == r} #{q}")
+  puts(&Person.anonymous(5).greet)
+end

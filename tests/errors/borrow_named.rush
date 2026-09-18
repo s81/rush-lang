@@ -1,0 +1,4 @@
+def main
+  let s = "a"
+  puts(s)
+end

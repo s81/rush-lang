@@ -1,0 +1,45 @@
+struct Noisy
+  name: String
+end
+
+impl Drop for Noisy
+  def drop(&mut self)
+    puts("drop #{@name}")
+  end
+end
+
+def consume(n: Noisy) -> Unit
+  puts("consuming #{n.name}")
+end
+
+def maybe(flag: Bool) -> Unit
+  let c = Noisy { name: "c" }
+  if flag
+    consume(c)
+  end
+  puts("maybe done")
+end
+
+enum Pair
+  Two(Noisy, Noisy)
+  One(Noisy)
+end
+
+# The or-pattern keeps the bound field and drops only what the matched alternative left.
+def pick(p: Pair) -> Unit
+  case p
+  in Two(_, n) | One(n) then puts("picked #{n.name}")
+  end
+end
+
+def main
+  let a = Noisy { name: "a" }
+  let mut b = Noisy { name: "b1" }
+  consume(a)
+  b = Noisy { name: "b2" }
+  maybe(true)
+  maybe(false)
+  pick(Two(Noisy { name: "x" }, Noisy { name: "y" }))
+  pick(One(Noisy { name: "z" }))
+  puts("end of main")
+end

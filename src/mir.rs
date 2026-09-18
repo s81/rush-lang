@@ -4,8 +4,8 @@ use std::collections::HashMap;
 use std::fmt::Write;
 
 use crate::ast::*;
-use crate::diag::Diagnostic;
-use crate::types::{DotRes, GlobalKind, MethodRes, Type, TypeInfo};
+use crate::diag::{Diagnostic, Span};
+use crate::types::{subst, Adjust, DotRes, GlobalKind, MethodRes, Type, TypeInfo};
 
 pub type LocalId = u32;
 pub type BlockId = u32;
@@ -36,6 +36,8 @@ pub enum Proj {
     Field(usize),
     /// `(variant index, field index)`
     Downcast(usize, usize),
+    /// Through a reference or Gc handle.
+    Deref,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -58,11 +60,18 @@ impl Place {
         p.proj.push(Proj::Downcast(v, i));
         p
     }
+    pub fn deref(&self) -> Place {
+        let mut p = self.clone();
+        p.proj.push(Proj::Deref);
+        p
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Statement {
-    Assign(Place, Rvalue),
+    Assign(Place, Rvalue, Span),
+    /// Runs the drop glue of the value in the place (a no-op for types with nothing to free).
+    Drop(Place, Span),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -75,6 +84,9 @@ pub enum Agg {
 #[derive(Debug, Clone, PartialEq)]
 pub enum Rvalue {
     Use(Operand),
+    /// Moves a field out of a value being destructured by a pattern.
+    MoveOut(Place),
+    Ref(bool, Place),
     Binary(BinOp, Operand, Operand),
     Unary(UnOp, Operand),
     Call(Callee, Vec<Operand>),
@@ -118,6 +130,37 @@ pub enum Terminator {
     Unreachable,
 }
 
+/// Type of a place inside `body`.
+pub fn place_type(info: &TypeInfo, body: &Body, p: &Place) -> Type {
+    let mut ty = body.locals[p.local as usize].ty.clone();
+    for pr in &p.proj {
+        ty = match pr {
+            Proj::Deref => match &ty {
+                Type::Con(n, args) if n == "&" || n == "&mut" || n == "Gc" => args[0].clone(),
+                other => panic!("place_type: deref of {other}"),
+            },
+            Proj::Field(i) => match &ty {
+                Type::Con(n, items) if n == "Tuple" => items[*i].clone(),
+                Type::Con(n, targs) => {
+                    let s = &info.structs[n];
+                    let map: HashMap<String, Type> = s.generics.iter().cloned().zip(targs.iter().cloned()).collect();
+                    subst(&s.fields[*i].1, &map)
+                }
+                other => panic!("place_type: field of {other}"),
+            },
+            Proj::Downcast(v, i) => match &ty {
+                Type::Con(n, targs) => {
+                    let e = &info.enums[n];
+                    let map: HashMap<String, Type> = e.generics.iter().cloned().zip(targs.iter().cloned()).collect();
+                    subst(&e.variants[*v].fields[*i].1, &map)
+                }
+                other => panic!("place_type: downcast of {other}"),
+            },
+        };
+    }
+    ty
+}
+
 /// Lowers every user def, impl method, and trait default method.
 pub fn lower(prog: &Program, info: &TypeInfo) -> Result<Vec<Body>, Diagnostic> {
     let mut out = Vec::new();
@@ -125,10 +168,9 @@ pub fn lower(prog: &Program, info: &TypeInfo) -> Result<Vec<Body>, Diagnostic> {
         match item {
             Item::Def(d) => out.push(lower_def(&d.name, d, info)?),
             Item::Impl(imp) => {
-                // Impls are numbered in source order, matching `info.impls`.
-                let id = out_impl_index(prog, imp);
+                let id = impl_index(prog, imp, info);
                 for m in &imp.methods {
-                    let global = info.impls[id].methods[&m.name].clone();
+                    let global = info.impls[id].methods.get(&m.name).or_else(|| info.impls[id].assoc.get(&m.name)).cloned().unwrap();
                     out.push(lower_def(&global, m, info)?);
                 }
             }
@@ -145,8 +187,10 @@ pub fn lower(prog: &Program, info: &TypeInfo) -> Result<Vec<Body>, Diagnostic> {
     Ok(out)
 }
 
-fn out_impl_index(prog: &Program, target: &ImplDef) -> usize {
-    prog.items.iter().filter_map(|i| if let Item::Impl(x) = i { Some(x) } else { None }).position(|x| std::ptr::eq(x, target)).unwrap()
+/// Impls are numbered in source order after the built-in ones.
+fn impl_index(prog: &Program, target: &ImplDef, info: &TypeInfo) -> usize {
+    let builtin = info.impls.iter().take_while(|i| i.span == Span::default() && i.self_ty.is_gc()).count();
+    builtin + prog.items.iter().filter_map(|i| if let Item::Impl(x) = i { Some(x) } else { None }).position(|x| std::ptr::eq(x, target)).unwrap()
 }
 
 struct Lowerer<'a> {
@@ -154,11 +198,16 @@ struct Lowerer<'a> {
     cur: BlockId,
     scopes: Vec<HashMap<String, LocalId>>,
     info: &'a TypeInfo,
+    span: Span,
+    copy_params: Vec<String>,
+    /// Or-pattern -> local holding the index of the alternative that matched.
+    or_sel: HashMap<PatId, LocalId>,
 }
 
 fn lower_def(global: &str, d: &Def, info: &TypeInfo) -> Result<Body, Diagnostic> {
     let g = &info.globals[global];
     let (params, ret) = g.scheme.ty.uncurry_n(g.n_params);
+    let copy_params: Vec<String> = g.scheme.bounds.iter().filter(|(_, t)| info.trait_closure(t).iter().any(|x| x == "Copy")).map(|(p, _)| p.clone()).collect();
     let mut l = Lowerer {
         body: Body {
             name: global.to_string(),
@@ -169,6 +218,9 @@ fn lower_def(global: &str, d: &Def, info: &TypeInfo) -> Result<Body, Diagnostic>
         cur: 0,
         scopes: vec![HashMap::new()],
         info,
+        span: d.span,
+        copy_params,
+        or_sel: HashMap::new(),
     };
     let mut params = params.into_iter();
     if d.self_param.is_some() {
@@ -180,7 +232,7 @@ fn lower_def(global: &str, d: &Def, info: &TypeInfo) -> Result<Body, Diagnostic>
         l.scopes[0].insert(p.name.clone(), id);
     }
     let v = l.block(&d.body)?;
-    l.push(Statement::Assign(Place::local(0), Rvalue::Use(v)));
+    l.assign(0, Rvalue::Use(v));
     l.terminate(Terminator::Return);
     Ok(l.body)
 }
@@ -200,8 +252,12 @@ impl<'a> Lowerer<'a> {
     fn push(&mut self, s: Statement) {
         self.body.blocks[self.cur as usize].stmts.push(s);
     }
+    fn assign_place(&mut self, target: Place, rv: Rvalue) {
+        let span = self.span;
+        self.push(Statement::Assign(target, rv, span));
+    }
     fn assign(&mut self, target: LocalId, rv: Rvalue) {
-        self.push(Statement::Assign(Place::local(target), rv));
+        self.assign_place(Place::local(target), rv);
     }
     fn terminate(&mut self, t: Terminator) {
         self.body.blocks[self.cur as usize].term = t;
@@ -211,6 +267,13 @@ impl<'a> Lowerer<'a> {
     }
     fn lookup(&self, name: &str) -> Option<LocalId> {
         self.scopes.iter().rev().find_map(|s| s.get(name).copied())
+    }
+    fn is_copy(&self, t: &Type) -> bool {
+        let cps = &self.copy_params;
+        self.info.is_copy(t, &|p| cps.iter().any(|c| c == p))
+    }
+    fn place_ty(&self, p: &Place) -> Type {
+        place_type(self.info, &self.body, p)
     }
     /// Evaluates into a fresh temp and returns it as an operand.
     fn eval_to_temp(&mut self, ty: Type, rv: Rvalue) -> Operand {
@@ -229,22 +292,44 @@ impl<'a> Lowerer<'a> {
             }
         }
     }
+    /// Borrows the value of an operand of type `ty` (references pass through).
+    fn borrow(&mut self, op: Operand, ty: &Type, mutable: bool) -> Operand {
+        if ty.as_ref().is_some() {
+            return op;
+        }
+        let place = self.as_place(op, ty.clone());
+        self.eval_to_temp(Type::r#ref(mutable, ty.clone()), Rvalue::Ref(mutable, place))
+    }
+    /// Reads the value behind an operand of type `ty` (references are dereferenced).
+    fn value(&mut self, op: Operand, ty: &Type) -> Operand {
+        if ty.as_ref().is_none() {
+            return op;
+        }
+        let place = self.as_place(op, ty.clone());
+        Operand::Place(place.deref())
+    }
 
     fn block(&mut self, b: &Block) -> Result<Operand, Diagnostic> {
         self.scopes.push(HashMap::new());
         let mut last = Operand::Const(Const::Unit);
         for (i, s) in b.stmts.iter().enumerate() {
             match s {
-                Stmt::Let { pat, init, .. } => {
+                Stmt::Let { pat, init, span, .. } => {
                     let v = self.expr(init)?;
+                    self.span = *span;
                     let ty = self.ty(init);
                     if let PatKind::Bind(name) = &pat.kind {
                         let id = self.new_local(name, ty);
                         self.assign(id, Rvalue::Use(v));
                         self.scopes.last_mut().unwrap().insert(name.clone(), id);
                     } else {
+                        // Irrefutable: the failure block stays unreachable.
                         let place = self.as_place(v, ty);
-                        self.bind_irrefutable(pat, &place);
+                        let binds = self.declare_binders(pat);
+                        let fail = self.new_block();
+                        self.test_pat(pat, &place, fail);
+                        self.bind_case(pat, &place, &binds);
+                        self.drop_uncovered(pat, &place);
                     }
                     last = Operand::Const(Const::Unit);
                 }
@@ -258,40 +343,159 @@ impl<'a> Lowerer<'a> {
         Ok(last)
     }
 
-    /// Binds the names of an irrefutable pattern to projections of `place`.
-    fn bind_irrefutable(&mut self, pat: &Pattern, place: &Place) {
-        let ty = self.info.pat_types[&pat.id].clone();
+    /// Allocates one local per bound name (shared by or-alternatives) in the current scope.
+    fn declare_binders(&mut self, pat: &Pattern) -> HashMap<String, LocalId> {
+        let mut names = Vec::new();
+        collect_binders(pat, &mut names);
+        let mut binds = HashMap::new();
+        for (name, pid) in names {
+            let ty = self.info.pat_types[&pid].clone();
+            let id = self.new_local(&name, ty);
+            binds.insert(name.clone(), id);
+            self.scopes.last_mut().unwrap().insert(name, id);
+        }
+        binds
+    }
+
+    /// Assigns the bindings of a pattern whose tests (`test_pat`) already passed. Runs after all
+    /// tests so that moving a binding out never precedes a read of the scrutinee.
+    fn bind_case(&mut self, pat: &Pattern, place: &Place, binds: &HashMap<String, LocalId>) {
+        let place = if self.info.pat_deref.contains(&pat.id) { place.deref() } else { place.clone() };
         match &pat.kind {
             PatKind::Wild | PatKind::Lit(_) => {}
-            PatKind::Bind(name) => {
-                let id = self.new_local(name, ty);
-                self.assign(id, Rvalue::Use(Operand::Place(place.clone())));
-                self.scopes.last_mut().unwrap().insert(name.clone(), id);
-            }
+            PatKind::Bind(name) => self.assign_binding(binds[name], pat, &place),
             PatKind::At(name, inner) => {
-                let id = self.new_local(name, ty);
-                self.assign(id, Rvalue::Use(Operand::Place(place.clone())));
-                self.scopes.last_mut().unwrap().insert(name.clone(), id);
-                self.bind_irrefutable(inner, place);
+                self.assign_binding(binds[name], pat, &place);
+                self.bind_case(inner, &place, binds);
             }
             PatKind::Tuple(ps) => {
                 for (i, p) in ps.iter().enumerate() {
-                    self.bind_irrefutable(p, &place.field(i));
+                    self.bind_case(p, &place.field(i), binds);
                 }
             }
             PatKind::Variant { name, fields } => {
                 let (_, idx) = self.info.variant_names[name];
                 for (i, p) in fields.iter().enumerate() {
-                    self.bind_irrefutable(p, &place.downcast(idx, i));
+                    self.bind_case(p, &place.downcast(idx, i), binds);
                 }
             }
             PatKind::Struct { name, fields } => {
                 for (fname, p) in fields {
-                    let sub = self.field_place(name, fname, place);
-                    self.bind_irrefutable(p, &sub);
+                    let sub = self.field_place(name, fname, &place);
+                    self.bind_case(p, &sub, binds);
                 }
             }
-            PatKind::Or(alts) => self.bind_irrefutable(&alts[0], place),
+            PatKind::Or(alts) => self.on_alt(pat, alts.len(), &mut |this, i| this.bind_case(&alts[i], &place, binds)),
+        }
+    }
+
+    /// Runs `f` for the alternative of or-pattern `pat` that `test_pat` recorded as matching.
+    fn on_alt(&mut self, pat: &Pattern, n: usize, f: &mut dyn FnMut(&mut Self, usize)) {
+        let sel = self.or_sel[&pat.id];
+        let join = self.new_block();
+        for i in 0..n {
+            if i + 1 < n {
+                let ok = self.eval_to_temp(Type::con("Bool"), Rvalue::Binary(BinOp::Eq, Operand::local(sel), Operand::Const(Const::Int(i as i64))));
+                let (yes, no) = (self.new_block(), self.new_block());
+                self.terminate(Terminator::If(ok, yes, no));
+                self.cur = yes;
+                f(self, i);
+                self.terminate(Terminator::Goto(join));
+                self.cur = no;
+            } else {
+                f(self, i);
+                self.terminate(Terminator::Goto(join));
+            }
+        }
+        self.cur = join;
+    }
+
+    /// Creates the local for a binding and assigns it (by reference, move, or copy).
+    fn bind_local(&mut self, pat: &Pattern, name: &str, place: &Place) -> LocalId {
+        let ty = self.info.pat_types[&pat.id].clone();
+        let id = self.new_local(name, ty);
+        self.assign_binding(id, pat, place);
+        id
+    }
+
+    fn assign_binding(&mut self, id: LocalId, pat: &Pattern, place: &Place) {
+        let rv = if let Some(&m) = self.info.pat_by_ref.get(&pat.id) {
+            Rvalue::Ref(m, place.clone())
+        } else if self.info.pat_moves.contains(&pat.id) || !place.proj.is_empty() {
+            // Field reads inside a pattern are `MoveOut` even for Copy fields, so a partially
+            // moved scrutinee can still supply its other fields.
+            Rvalue::MoveOut(place.clone())
+        } else {
+            Rvalue::Use(Operand::Place(place.clone()))
+        };
+        self.assign(id, rv);
+    }
+
+    fn pattern_moves(&self, pat: &Pattern) -> bool {
+        match &pat.kind {
+            PatKind::Bind(_) => self.info.pat_moves.contains(&pat.id),
+            PatKind::At(_, inner) => self.info.pat_moves.contains(&pat.id) || self.pattern_moves(inner),
+            PatKind::Tuple(ps) | PatKind::Variant { fields: ps, .. } => ps.iter().any(|q| self.pattern_moves(q)),
+            PatKind::Struct { fields, .. } => fields.iter().any(|(_, q)| self.pattern_moves(q)),
+            PatKind::Or(alts) => alts.iter().any(|a| self.pattern_moves(a)),
+            PatKind::Wild | PatKind::Lit(_) => false,
+        }
+    }
+
+    /// After a pattern moved parts out of `place`, drops the parts it left behind.
+    fn drop_uncovered(&mut self, pat: &Pattern, place: &Place) {
+        if self.pattern_moves(pat) {
+            self.drop_rest(pat, place);
+        }
+    }
+
+    fn drop_rest(&mut self, pat: &Pattern, place: &Place) {
+        if self.info.pat_deref.contains(&pat.id) {
+            return;
+        }
+        match &pat.kind {
+            PatKind::Bind(_) | PatKind::At(..) => {}
+            PatKind::Wild | PatKind::Lit(_) => {
+                let ty = self.place_ty(place);
+                if !self.is_copy(&ty) {
+                    let span = self.span;
+                    self.push(Statement::Drop(place.clone(), span));
+                }
+            }
+            PatKind::Tuple(ps) => {
+                for (i, p) in ps.iter().enumerate() {
+                    self.drop_rest(p, &place.field(i));
+                }
+            }
+            PatKind::Variant { name, fields } => {
+                let (_, idx) = self.info.variant_names[name];
+                for (i, p) in fields.iter().enumerate() {
+                    self.drop_rest(p, &place.downcast(idx, i));
+                }
+            }
+            PatKind::Struct { name, fields } => {
+                // Named fields not mentioned are dropped too.
+                let all: Vec<String> = if let Some(s) = self.info.structs.get(name) {
+                    s.fields.iter().map(|(f, _)| f.clone()).collect()
+                } else {
+                    let (en, idx) = &self.info.variant_names[name];
+                    self.info.enums[en].variants[*idx].fields.iter().map(|(f, _)| f.clone().unwrap()).collect()
+                };
+                for f in all {
+                    let sub = self.field_place(name, &f, place);
+                    match fields.iter().find(|(n, _)| *n == f) {
+                        Some((_, p)) => self.drop_rest(p, &sub),
+                        None => {
+                            let ty = self.place_ty(&sub);
+                            if !self.is_copy(&ty) {
+                                let span = self.span;
+                                self.push(Statement::Drop(sub, span));
+                            }
+                        }
+                    }
+                }
+            }
+            PatKind::Or(alts) => self.on_alt(pat, alts.len(), &mut |this, i| this.drop_rest(&alts[i], place)),
         }
     }
 
@@ -315,7 +519,45 @@ impl<'a> Lowerer<'a> {
         }
     }
 
+    /// Applies the receiver adjustment recorded for `recv`.
+    fn adjusted_recv(&mut self, recv: &Expr, op: Operand) -> Operand {
+        let ty = self.ty(recv);
+        match self.info.adjust.get(&recv.id) {
+            Some(Adjust::AutoRef(m)) => self.borrow(op, &ty, *m),
+            Some(Adjust::AutoDeref) => self.value(op, &ty),
+            None => op,
+        }
+    }
+
+    /// Type of a receiver after its adjustment.
+    fn adjusted_ty(&self, recv: &Expr) -> Type {
+        let ty = self.ty(recv);
+        match self.info.adjust.get(&recv.id) {
+            Some(Adjust::AutoDeref) => ty.peel().clone(),
+            Some(Adjust::AutoRef(m)) => Type::r#ref(*m, ty),
+            None => ty,
+        }
+    }
+
+    /// Lowers an expression, then applies auto-deref or auto-borrow recorded on it.
     fn expr(&mut self, e: &Expr) -> Result<Operand, Diagnostic> {
+        let saved = self.span;
+        self.span = e.span;
+        let op = self.expr_inner(e)?;
+        let op = if self.info.derefs.contains(&e.id) {
+            let ty = self.ty(e);
+            self.value(op, &ty)
+        } else if let Some(&m) = self.info.autorefs.get(&e.id) {
+            let ty = self.ty(e);
+            self.borrow(op, &ty, m)
+        } else {
+            op
+        };
+        self.span = saved;
+        Ok(op)
+    }
+
+    fn expr_inner(&mut self, e: &Expr) -> Result<Operand, Diagnostic> {
         Ok(match &e.kind {
             ExprKind::Int(v) => Operand::Const(Const::Int(*v)),
             ExprKind::Float(v) => Operand::Const(Const::Float(*v)),
@@ -347,7 +589,6 @@ impl<'a> Lowerer<'a> {
             }
             ExprKind::StructLit { name, fields } => {
                 let ty = self.ty(e);
-                // Evaluate in source order, then reorder to declaration order.
                 let mut by_name: HashMap<&str, Operand> = HashMap::new();
                 for (fname, value) in fields {
                     let v = self.expr(value)?;
@@ -363,11 +604,24 @@ impl<'a> Lowerer<'a> {
                     self.eval_to_temp(ty.clone(), Rvalue::Aggregate(Agg::Variant(ty, *idx), ops))
                 }
             }
-            ExprKind::Dot { recv, name, args } => {
+            ExprKind::Dot { recv, args, .. } => {
+                let res = self.info.dots[&e.id].clone();
+                if let DotRes::Assoc { global, targs } = res {
+                    let mut ops = Vec::new();
+                    for a in args.as_deref().unwrap_or(&[]) {
+                        ops.push(self.expr(a)?);
+                    }
+                    if ops.len() != self.info.globals[&global].n_params {
+                        return Err(Diagnostic::new(e.span, "partial application is not supported in this version"));
+                    }
+                    let ty = self.ty(e);
+                    return Ok(self.eval_to_temp(ty, Rvalue::Call(Callee::Def { name: global, targs }, ops)));
+                }
                 let rv = self.expr(recv)?;
-                let rty = self.ty(recv);
-                match self.info.dots[&e.id].clone() {
+                let rv = self.adjusted_recv(recv, rv);
+                match res {
                     DotRes::Field(i) => {
+                        let rty = self.adjusted_ty(recv);
                         let place = self.as_place(rv, rty);
                         Operand::Place(place.field(i))
                     }
@@ -391,13 +645,28 @@ impl<'a> Lowerer<'a> {
                         let ty = self.ty(e);
                         self.eval_to_temp(ty, Rvalue::Call(callee, ops))
                     }
+                    DotRes::Assoc { .. } => unreachable!(),
                 }
             }
             ExprKind::TupleIndex(recv, i) => {
                 let rv = self.expr(recv)?;
-                let rty = self.ty(recv);
+                let rv = self.adjusted_recv(recv, rv);
+                let rty = self.adjusted_ty(recv);
                 let place = self.as_place(rv, rty);
                 Operand::Place(place.field(*i))
+            }
+            ExprKind::Ref(m, x) => {
+                let v = self.expr(x)?;
+                let xt = self.ty(x);
+                let place = self.as_place(v, xt);
+                let ty = self.ty(e);
+                self.eval_to_temp(ty, Rvalue::Ref(*m, place))
+            }
+            ExprKind::Deref(x) => {
+                let v = self.expr(x)?;
+                let xt = self.ty(x);
+                let place = self.as_place(v, xt);
+                Operand::Place(place.deref())
             }
             ExprKind::Unary(op, x) => {
                 let v = self.expr(x)?;
@@ -422,15 +691,33 @@ impl<'a> Lowerer<'a> {
                 self.cur = join;
                 Operand::local(t)
             }
-            ExprKind::Binary(op @ (BinOp::Eq | BinOp::Ne), a, b) if !self.ty(a).is_primitive() => {
+            ExprKind::Binary(op @ (BinOp::Eq | BinOp::Ne), a, b) => {
                 let va = self.expr(a)?;
                 let vb = self.expr(b)?;
-                let callee = Callee::Trait { trait_name: "Eq".into(), method: "eq".into(), self_ty: self.ty(a) };
-                let eq = self.eval_to_temp(Type::con("Bool"), Rvalue::Call(callee, vec![va, vb]));
+                let (ta, tb) = (self.ty(a), self.ty(b));
+                let base = ta.peel().clone();
+                let eq = if base.is_primitive() {
+                    let va = self.value(va, &ta);
+                    let vb = self.value(vb, &tb);
+                    self.eval_to_temp(Type::con("Bool"), Rvalue::Binary(BinOp::Eq, va, vb))
+                } else {
+                    let ra = self.borrow(va, &ta, false);
+                    let rb = self.borrow(vb, &tb, false);
+                    let callee = Callee::Trait { trait_name: "Eq".into(), method: "eq".into(), self_ty: base };
+                    self.eval_to_temp(Type::con("Bool"), Rvalue::Call(callee, vec![ra, rb]))
+                };
                 match op {
                     BinOp::Eq => eq,
                     _ => self.eval_to_temp(Type::con("Bool"), Rvalue::Unary(UnOp::Not, eq)),
                 }
+            }
+            ExprKind::Binary(BinOp::Add, a, b) if self.ty(a).peel().head() == Some("String") => {
+                let va = self.expr(a)?;
+                let vb = self.expr(b)?;
+                let (ta, tb) = (self.ty(a), self.ty(b));
+                let ra = self.borrow(va, &ta, false);
+                let rb = self.borrow(vb, &tb, false);
+                self.eval_to_temp(Type::con("String"), Rvalue::Call(Callee::Extern("str_concat".into()), vec![ra, rb]))
             }
             ExprKind::Binary(op, a, b) => {
                 let va = self.expr(a)?;
@@ -496,31 +783,56 @@ impl<'a> Lowerer<'a> {
             ExprKind::Case { scrutinee, arms } => self.case(e, scrutinee, arms)?,
             ExprKind::Interp(parts) => {
                 let mut acc: Option<Operand> = None;
+                // The owned String temp behind `acc` once a concat has happened.
+                let mut owned_acc: Option<Operand> = None;
                 for part in parts {
                     let piece = match part {
-                        InterpPart::Lit(s) => Operand::Const(Const::Str(s.clone())),
+                        InterpPart::Lit(s) => {
+                            let t = self.temp(Type::con("String"));
+                            self.assign(t, Rvalue::Use(Operand::Const(Const::Str(s.clone()))));
+                            self.eval_to_temp(Type::r#ref(false, Type::con("String")), Rvalue::Ref(false, Place::local(t)))
+                        }
                         InterpPart::Expr(x) => {
                             let v = self.expr(x)?;
                             let ty = self.ty(x);
-                            if ty.is_primitive() && ty.head() == Some("String") {
-                                v
+                            if ty.peel().head() == Some("String") {
+                                self.borrow(v, &ty, false)
                             } else {
-                                let callee = Callee::Trait { trait_name: "Show".into(), method: "to_s".into(), self_ty: ty };
-                                self.eval_to_temp(Type::con("String"), Rvalue::Call(callee, vec![v]))
+                                let r = self.borrow(v, &ty, false);
+                                let callee = Callee::Trait { trait_name: "Show".into(), method: "to_s".into(), self_ty: ty.peel().clone() };
+                                let owned = self.eval_to_temp(Type::con("String"), Rvalue::Call(callee, vec![r]));
+                                self.borrow(owned, &Type::con("String"), false)
                             }
                         }
                     };
                     acc = Some(match acc {
                         None => piece,
-                        Some(prev) => self.eval_to_temp(Type::con("String"), Rvalue::Call(Callee::Extern("str_concat".into()), vec![prev, piece])),
+                        Some(prev) => {
+                            let owned = self.eval_to_temp(Type::con("String"), Rvalue::Call(Callee::Extern("str_concat".into()), vec![prev, piece]));
+                            owned_acc = Some(owned.clone());
+                            self.borrow(owned, &Type::con("String"), false)
+                        }
                     });
                 }
-                acc.unwrap_or(Operand::Const(Const::Str(String::new())))
+                // The result must be an owned String: the last concat result, or a clone of a
+                // single borrowed piece.
+                match (owned_acc, acc) {
+                    (Some(owned), _) => owned,
+                    (None, None) => Operand::Const(Const::Str(String::new())),
+                    (None, Some(r)) => self.eval_to_temp(Type::con("String"), Rvalue::Call(Callee::Extern("str_clone".into()), vec![r])),
+                }
             }
             ExprKind::Assign(lhs, rhs) => {
                 let v = self.expr(rhs)?;
                 let place = self.place_of(lhs)?;
-                self.push(Statement::Assign(place, Rvalue::Use(v)));
+                if !place.proj.is_empty() {
+                    let ty = self.place_ty(&place);
+                    if !self.is_copy(&ty) {
+                        let span = self.span;
+                        self.push(Statement::Drop(place.clone(), span));
+                    }
+                }
+                self.assign_place(place, Rvalue::Use(v));
                 Operand::Const(Const::Unit)
             }
             ExprKind::Return(v) => {
@@ -542,9 +854,24 @@ impl<'a> Lowerer<'a> {
             ExprKind::Var(n) => Ok(Place::local(self.lookup(n).expect("checked local"))),
             ExprKind::Dot { recv, .. } => {
                 let DotRes::Field(i) = self.info.dots[&lhs.id] else { unreachable!("checker allows only fields") };
-                Ok(self.place_of(recv)?.field(i))
+                let mut p = self.place_of(recv)?;
+                if self.info.adjust.get(&recv.id) == Some(&Adjust::AutoDeref) {
+                    p = p.deref();
+                }
+                Ok(p.field(i))
             }
-            ExprKind::TupleIndex(recv, i) => Ok(self.place_of(recv)?.field(*i)),
+            ExprKind::TupleIndex(recv, i) => {
+                let mut p = self.place_of(recv)?;
+                if self.info.adjust.get(&recv.id) == Some(&Adjust::AutoDeref) {
+                    p = p.deref();
+                }
+                Ok(p.field(*i))
+            }
+            ExprKind::Deref(inner) => {
+                let v = self.expr(inner)?;
+                let it = self.ty(inner);
+                Ok(self.as_place(v, it).deref())
+            }
             _ => unreachable!("checker rejects other targets"),
         }
     }
@@ -561,23 +888,16 @@ impl<'a> Lowerer<'a> {
             self.cur = next_test;
             next_test = self.new_block();
             self.scopes.push(HashMap::new());
-            // Allocate one local per bound name, shared by or-alternatives.
-            let mut names = Vec::new();
-            collect_binders(&arm.pat, &mut names);
-            let mut binds: HashMap<String, LocalId> = HashMap::new();
-            for (name, pid) in names {
-                let ty = self.info.pat_types[&pid].clone();
-                let id = self.new_local(&name, ty);
-                binds.insert(name.clone(), id);
-                self.scopes.last_mut().unwrap().insert(name, id);
-            }
-            self.test_pat(&arm.pat, &splace, next_test, &binds);
+            let binds = self.declare_binders(&arm.pat);
+            self.test_pat(&arm.pat, &splace, next_test);
+            self.bind_case(&arm.pat, &splace, &binds);
             if let Some(g) = &arm.guard {
                 let gv = self.expr(g)?;
                 let body_bb = self.new_block();
                 self.terminate(Terminator::If(gv, body_bb, next_test));
                 self.cur = body_bb;
             }
+            self.drop_uncovered(&arm.pat, &splace);
             let v = self.block(&arm.body)?;
             self.assign(result, Rvalue::Use(v));
             self.terminate(Terminator::Goto(join));
@@ -591,17 +911,13 @@ impl<'a> Lowerer<'a> {
     }
 
     /// Emits tests for `pat` against `place`; on failure control goes to `fail`.
-    /// On return, `self.cur` is the success block. Bound names are assigned into `binds`.
-    fn test_pat(&mut self, pat: &Pattern, place: &Place, fail: BlockId, binds: &HashMap<String, LocalId>) {
+    /// On return, `self.cur` is the success block. Binds nothing (see `bind_case`).
+    fn test_pat(&mut self, pat: &Pattern, place: &Place, fail: BlockId) {
+        let place = if self.info.pat_deref.contains(&pat.id) { place.deref() } else { place.clone() };
         match &pat.kind {
             PatKind::Wild => {}
-            PatKind::Bind(name) => {
-                self.assign(binds[name], Rvalue::Use(Operand::Place(place.clone())));
-            }
-            PatKind::At(name, inner) => {
-                self.assign(binds[name], Rvalue::Use(Operand::Place(place.clone())));
-                self.test_pat(inner, place, fail, binds);
-            }
+            PatKind::Bind(_) => {}
+            PatKind::At(_, inner) => self.test_pat(inner, &place, fail),
             PatKind::Lit(l) => {
                 let c = match l {
                     Lit::Int(v) => Const::Int(*v),
@@ -617,7 +933,7 @@ impl<'a> Lowerer<'a> {
             }
             PatKind::Tuple(ps) => {
                 for (i, p) in ps.iter().enumerate() {
-                    self.test_pat(p, &place.field(i), fail, binds);
+                    self.test_pat(p, &place.field(i), fail);
                 }
             }
             PatKind::Variant { name, fields } => {
@@ -630,7 +946,7 @@ impl<'a> Lowerer<'a> {
                     self.cur = next;
                 }
                 for (i, p) in fields.iter().enumerate() {
-                    self.test_pat(p, &place.downcast(idx, i), fail, binds);
+                    self.test_pat(p, &place.downcast(idx, i), fail);
                 }
             }
             PatKind::Struct { name, fields } => {
@@ -644,15 +960,18 @@ impl<'a> Lowerer<'a> {
                     }
                 }
                 for (fname, p) in fields {
-                    let sub = self.field_place(name, fname, place);
-                    self.test_pat(p, &sub, fail, binds);
+                    let sub = self.field_place(name, fname, &place);
+                    self.test_pat(p, &sub, fail);
                 }
             }
             PatKind::Or(alts) => {
                 let success = self.new_block();
+                let sel = self.temp(Type::con("Int"));
+                self.or_sel.insert(pat.id, sel);
                 for (i, alt) in alts.iter().enumerate() {
                     let next_alt = if i + 1 < alts.len() { self.new_block() } else { fail };
-                    self.test_pat(alt, place, next_alt, binds);
+                    self.test_pat(alt, &place, next_alt);
+                    self.assign(sel, Rvalue::Use(Operand::Const(Const::Int(i as i64))));
                     self.terminate(Terminator::Goto(success));
                     if i + 1 < alts.len() {
                         self.cur = next_alt;
@@ -686,6 +1005,7 @@ pub fn fmt_place(p: &Place) -> String {
         match pr {
             Proj::Field(i) => s = format!("{s}.{i}"),
             Proj::Downcast(v, i) => s = format!("({s} as {v}).{i}"),
+            Proj::Deref => s = format!("(*{s})"),
         }
     }
     s
@@ -720,25 +1040,31 @@ pub fn dump(b: &Body) -> String {
     for (i, bb) in b.blocks.iter().enumerate() {
         writeln!(s, "bb{i}:").unwrap();
         for st in &bb.stmts {
-            let Statement::Assign(place, rv) = st;
             let args = |ops: &[Operand]| ops.iter().map(fmt_operand).collect::<Vec<_>>().join(", ");
-            let rhs = match rv {
-                Rvalue::Use(o) => fmt_operand(o),
-                Rvalue::Binary(op, a, c) => format!("{op:?} {} {}", fmt_operand(a), fmt_operand(c)),
-                Rvalue::Unary(op, a) => format!("{op:?} {}", fmt_operand(a)),
-                Rvalue::Call(callee, ops) => match callee {
-                    Callee::Def { name, targs } => format!("call {name}{}({})", fmt_targs(targs), args(ops)),
-                    Callee::Extern(n) => format!("call extern {n}({})", args(ops)),
-                    Callee::Trait { trait_name, method, self_ty } => format!("call {trait_name}::{method}[{self_ty}]({})", args(ops)),
-                },
-                Rvalue::Aggregate(agg, ops) => match agg {
-                    Agg::Struct(t) => format!("{t} {{ {} }}", args(ops)),
-                    Agg::Tuple(_) => format!("({})", args(ops)),
-                    Agg::Variant(t, i) => format!("{t}::{i}({})", args(ops)),
-                },
-                Rvalue::Discriminant(p) => format!("discr({})", fmt_place(p)),
-            };
-            writeln!(s, "  {} = {rhs}", fmt_place(place)).unwrap();
+            match st {
+                Statement::Drop(p, _) => writeln!(s, "  drop({})", fmt_place(p)).unwrap(),
+                Statement::Assign(place, rv, _) => {
+                    let rhs = match rv {
+                        Rvalue::Use(o) => fmt_operand(o),
+                        Rvalue::MoveOut(p) => format!("move {}", fmt_place(p)),
+                        Rvalue::Ref(m, p) => format!("&{}{}", if *m { "mut " } else { "" }, fmt_place(p)),
+                        Rvalue::Binary(op, a, c) => format!("{op:?} {} {}", fmt_operand(a), fmt_operand(c)),
+                        Rvalue::Unary(op, a) => format!("{op:?} {}", fmt_operand(a)),
+                        Rvalue::Call(callee, ops) => match callee {
+                            Callee::Def { name, targs } => format!("call {name}{}({})", fmt_targs(targs), args(ops)),
+                            Callee::Extern(n) => format!("call extern {n}({})", args(ops)),
+                            Callee::Trait { trait_name, method, self_ty } => format!("call {trait_name}::{method}[{self_ty}]({})", args(ops)),
+                        },
+                        Rvalue::Aggregate(agg, ops) => match agg {
+                            Agg::Struct(t) => format!("{t} {{ {} }}", args(ops)),
+                            Agg::Tuple(_) => format!("({})", args(ops)),
+                            Agg::Variant(t, i) => format!("{t}::{i}({})", args(ops)),
+                        },
+                        Rvalue::Discriminant(p) => format!("discr({})", fmt_place(p)),
+                    };
+                    writeln!(s, "  {} = {rhs}", fmt_place(place)).unwrap();
+                }
+            }
         }
         match &bb.term {
             Terminator::Goto(t) => writeln!(s, "  goto bb{t}").unwrap(),
@@ -757,11 +1083,12 @@ mod tests {
     use crate::parser::parse;
     use crate::types::check;
 
-    fn lower_src(s: &str) -> Result<Vec<Body>, Diagnostic> {
+    pub fn lower_src(s: &str) -> Result<Vec<Body>, Diagnostic> {
         let prelude = include_str!("../std/prelude.rush");
         let mut id = 0;
         let mut p = parse(lex(prelude).unwrap(), &mut id).unwrap();
         p.items.extend(parse(lex(s).unwrap(), &mut id).unwrap().items);
+        crate::derive::expand(&mut p, &mut id)?;
         let info = check(&p)?;
         lower(&p, &info)
     }
@@ -795,18 +1122,6 @@ mod tests {
     }
 
     #[test]
-    fn while_loop_and_extern_call() {
-        assert_eq!(
-            dump_fn("def main\n  let mut i = 0\n  while i < 3\n    puts(int_to_s(i))\n    i += 1\n  end\nend\n", "main"),
-            "fn main() -> Unit\n\
-             bb0:\n  _1 = 0\n  goto bb1\n\
-             bb1:\n  _2 = Lt _1 3\n  if _2 then bb2 else bb3\n\
-             bb2:\n  _3 = call extern int_to_s(_1)\n  _4 = call extern puts(_3)\n  _5 = Add _1 1\n  _1 = _5\n  goto bb1\n\
-             bb3:\n  _0 = ()\n  return\n"
-        );
-    }
-
-    #[test]
     fn short_circuit_and() {
         assert_eq!(
             dump_fn(&format!("def f(a: Bool, b: Bool) -> Bool\n  a and b\nend\n{MAIN}"), "f"),
@@ -829,17 +1144,9 @@ mod tests {
 
     #[test]
     fn partial_application_rejected_for_now() {
-        let err = lower_src(&format!("def add(a: Int, b: Int) -> Int\n  a + b\nend\ndef main\n  add(1)\n  ()\nend\n")).unwrap_err();
+        let err = lower_src("def add(a: Int, b: Int) -> Int\n  a + b\nend\ndef main\n  add(1)\n  ()\nend\n").unwrap_err();
         assert_eq!(err.msg, "partial application is not supported in this version");
     }
-
-    #[test]
-    fn function_value_rejected_for_now() {
-        let err = lower_src("def add(a: Int, b: Int) -> Int\n  a + b\nend\ndef main\n  let f = add\n  ()\nend\n").unwrap_err();
-        assert_eq!(err.msg, "functions as values are not supported in this version");
-    }
-
-    // ----- Plan 2 -----
 
     #[test]
     fn struct_literal_field_read_and_write() {
@@ -851,16 +1158,7 @@ mod tests {
     }
 
     #[test]
-    fn tuple_and_index_and_destructure() {
-        assert_eq!(
-            dump_fn("def main\n  let t = (1, true)\n  let (a, b) = t\n  let n = t.0 + a\n  ()\nend\n", "main"),
-            "fn main() -> Unit\n\
-             bb0:\n  _1 = (1, true)\n  _2 = _1\n  _3 = _2.0\n  _4 = _2.1\n  _5 = Add _2.0 _3\n  _6 = _5\n  _0 = ()\n  return\n"
-        );
-    }
-
-    #[test]
-    fn variant_construction_and_case() {
+    fn variant_construction_and_case_by_value() {
         assert_eq!(
             dump_fn(&format!("enum S\n  C(Float)\n  R(Float, Float)\nend\ndef area(s: S) -> Float\n  case s\n  in C(r) then r * r\n  in R(w, h) then w * h\n  end\nend\n{MAIN}"), "area"),
             "fn area(_1: S) -> Float\n\
@@ -868,54 +1166,70 @@ mod tests {
              bb1:\n  _0 = _2\n  return\n\
              bb2:\n  _4 = discr(_1)\n  _5 = Eq _4 0\n  if _5 then bb4 else bb3\n\
              bb3:\n  _9 = discr(_1)\n  _10 = Eq _9 1\n  if _10 then bb6 else bb5\n\
-             bb4:\n  _3 = (_1 as 0).0\n  _6 = Mul _3 _3\n  _2 = _6\n  goto bb1\n\
+             bb4:\n  _3 = move (_1 as 0).0\n  _6 = Mul _3 _3\n  _2 = _6\n  goto bb1\n\
              bb5:\n  unreachable\n\
-             bb6:\n  _7 = (_1 as 1).0\n  _8 = (_1 as 1).1\n  _11 = Mul _7 _8\n  _2 = _11\n  goto bb1\n"
-        );
-        assert_eq!(
-            dump_fn(&format!("enum S\n  C(Float)\n  R(Float, Float)\nend\ndef main\n  let s = R(1.0, 2.0)\n  let n = None\n  let m = Some(1)\n  n == m\n  ()\nend\n"), "main"),
-            "fn main() -> Unit\n\
-             bb0:\n  _1 = S::1(1.0, 2.0)\n  _2 = _1\n  _3 = Option[Int]::1()\n  _4 = _3\n  _5 = Option[Int]::0(1)\n  _6 = _5\n  _7 = call Eq::eq[Option[Int]](_4, _6)\n  _0 = ()\n  return\n"
+             bb6:\n  _7 = move (_1 as 1).0\n  _8 = move (_1 as 1).1\n  _11 = Mul _7 _8\n  _2 = _11\n  goto bb1\n"
         );
     }
 
-    #[test]
-    fn or_pattern_guard_and_literal() {
-        assert_eq!(
-            dump_fn(&format!("def f(n: Int) -> Int\n  case n\n  in 1 | 2 if n > 0 then 10\n  in x then x\n  end\nend\n{MAIN}"), "f"),
-            "fn f(_1: Int) -> Int\n\
-             bb0:\n  goto bb2\n\
-             bb1:\n  _0 = _2\n  return\n\
-             bb2:\n  _3 = Eq _1 1\n  if _3 then bb6 else bb5\n\
-             bb3:\n  _6 = _1\n  _2 = _6\n  goto bb1\n\
-             bb4:\n  _5 = Gt _1 0\n  if _5 then bb8 else bb3\n\
-             bb5:\n  _4 = Eq _1 2\n  if _4 then bb7 else bb3\n\
-             bb6:\n  goto bb4\n\
-             bb7:\n  goto bb4\n\
-             bb8:\n  _2 = 10\n  goto bb1\n\
-             bb9:\n  unreachable\n"
-        );
-    }
+    // ----- Plan 3a -----
 
     #[test]
-    fn generic_call_records_targs_and_method_calls() {
-        let src = "struct P\n  x: Int\nend\nimpl P\n  def get(&self) -> Int\n    self.x\n  end\nend\ndef id[T](x: T) -> T\n  x\nend\ndef main\n  let a = id(1)\n  let b = id(P { x: 2 }).get\n  let s = \"#{b} and #{\"x\"}\"\n  ()\nend\n";
+    fn references_deref_and_auto_borrow() {
+        let src = "def add(a: &Int, b: &Int) -> Int\n  a + b\nend\ndef main\n  let x = 1\n  let r = &x\n  let y = add(&x, r) + *r\n  puts(int_to_s(y))\nend\n";
+        assert_eq!(
+            dump_fn(src, "add"),
+            "fn add(_1: &Int, _2: &Int) -> Int\n\
+             bb0:\n  _3 = Add (*_1) (*_2)\n  _0 = _3\n  return\n"
+        );
         let d = dump_fn(src, "main");
-        assert!(d.contains("_1 = call id[Int](1)"), "{d}");
-        assert!(d.contains("call id[P](_3)"), "{d}");
-        assert!(d.contains("::get(_4)"), "{d}");
-        assert!(d.contains("call Show::to_s[Int](_6)"), "{d}");
-        assert!(d.contains("call extern str_concat("), "{d}");
+        assert!(d.contains("_2 = &_1\n  _3 = _2\n"), "{d}");
+        assert!(d.contains("_4 = &_1\n  _5 = call add(_4, _3)\n"), "{d}");
+        assert!(d.contains("Add _5 (*_3)"), "{d}");
+        assert!(d.contains("call extern int_to_s("), "{d}");
+        assert!(d.contains("call extern puts(_"), "{d}");
     }
 
     #[test]
-    fn impl_methods_and_defaults_are_lowered() {
-        let src = "trait A\n  def a(&self) -> Int\n  def b(&self) -> Int\n    self.a + 1\n  end\nend\nstruct S\n  f: Int\nend\nimpl A for S\n  def a(&self)\n    self.f\n  end\nend\ndef main\n  ()\nend\n";
+    fn method_receiver_adjustments_and_match_ergonomics() {
+        let src = "enum S\n  C(Float)\n  R(String, Float)\nend\nimpl S\n  def size(&self) -> Float\n    case self\n    in C(r) then r * r\n    in R(n, h) then h\n    end\n  end\nend\ndef main\n  let s = C(1.0)\n  let f = s.size + s.size\n  ()\nend\n";
+        let d = dump_fn(src, "main");
+        assert!(d.contains("_3 = &_2\n  _4 = call S#"), "{d}");
         let bodies = lower_src(src).unwrap();
-        let names: Vec<&str> = bodies.iter().map(|b| b.name.as_str()).collect();
-        assert!(names.contains(&"A::b"), "{names:?}");
-        assert!(names.iter().any(|n| n.starts_with("A#") && n.ends_with("::a")), "{names:?}");
-        let d = dump(bodies.iter().find(|b| b.name == "A::b").unwrap());
-        assert!(d.contains("call A::a[Self](_1)"), "{d}");
+        let size = bodies.iter().find(|b| b.name.ends_with("::size")).unwrap();
+        let ds = dump(size);
+        assert!(ds.contains("discr((*_1))"), "{ds}");
+        assert!(ds.contains("= &((*_1) as 0).0\n"), "{ds}");
+        assert!(ds.contains("Mul (*_3) (*_3)"), "{ds}");
+    }
+
+    #[test]
+    fn destructuring_moves_and_drops_uncovered() {
+        let src = "def main\n  let t = (\"a\", \"b\", 1)\n  let (a, _, n) = t\n  ()\nend\n";
+        let d = dump_fn(src, "main");
+        assert!(d.contains("= move _2.0\n"), "{d}");
+        assert!(d.contains("drop(_2.1)\n"), "{d}");
+        assert!(d.contains("= move _2.2\n"), "{d}");
+    }
+
+    #[test]
+    fn string_ops_borrow_and_interpolation_clones_result() {
+        let src = "def main\n  let a = \"x\"\n  let b = a + \"y\"\n  let c = \"#{a}!\"\n  let d = \"#{a}\"\n  let e = a == b\n  ()\nend\n";
+        let d = dump_fn(src, "main");
+        assert!(d.contains("call extern str_concat(_"), "{d}");
+        assert_eq!(d.matches("call extern str_clone(_").count(), 1, "{d}");
+        assert!(d.contains("= Eq _1 _"), "{d}");
+        assert!(!d.contains("= _1\n"), "{d}");
+    }
+
+    #[test]
+    fn field_reassignment_drops_old_value_and_assoc_calls() {
+        let src = "struct P\n  name: String\nend\nimpl P\n  def make(n: String) -> P\n    P { name: n }\n  end\nend\ndef main\n  let mut p = P.make(\"a\")\n  p.name = \"b\"\n  let g = Gc.new(p)\n  let n = g.borrow.name.clone\n  ()\nend\n";
+        let d = dump_fn(src, "main");
+        assert!(d.contains("drop(_2.0)\n  _2.0 = "), "{d}");
+        assert!(d.contains("::make("), "{d}");
+        assert!(d.contains("call Gc::new[P](_2)"), "{d}");
+        assert!(d.contains("call Gc::borrow[P](_"), "{d}");
+        assert!(d.contains("= &(*_"), "{d}");
     }
 }

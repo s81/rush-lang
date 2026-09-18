@@ -1,0 +1,13 @@
+struct P
+  name: String
+end
+
+def take(p: P) -> Unit
+  ()
+end
+
+def main
+  let p = P { name: "a" }
+  take(p)
+  take(p)
+end

@@ -1,0 +1,29 @@
+struct Pair[A, B]
+  derive Show, Eq, Clone
+  first: A
+  second: B
+end
+
+enum Shape
+  derive Show, Eq, Clone
+  Circle(Float)
+  Rect { w: Float, h: Float }
+  Empty
+end
+
+struct Pt
+  derive Copy, Show, Eq
+  x: Int
+end
+
+def main
+  let p = Pair { first: 1, second: "one" }
+  let q = p.clone
+  puts("#{p} #{p == q} #{p == Pair { first: 2, second: "one" }}")
+  let shapes = (Circle(1.0), Rect { w: 2.0, h: 3.0 }, Empty)
+  puts("#{shapes.0} #{shapes.1} #{shapes.2}")
+  puts("#{shapes.0 == Circle(1.0)} #{shapes.0 == shapes.2} #{shapes.1.clone == shapes.1}")
+  let a = Pt { x: 5 }
+  let b = a
+  puts("#{a} #{a == b}")
+end

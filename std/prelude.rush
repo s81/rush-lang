@@ -1,16 +1,33 @@
-extern "C" def puts(s: String) -> Unit
-extern "C" def print(s: String) -> Unit
+extern "C" def puts(s: &String) -> Unit
+extern "C" def print(s: &String) -> Unit
 extern "C" def int_to_s(v: Int) -> String
 extern "C" def float_to_s(v: Float) -> String
 extern "C" def bool_to_s(v: Bool) -> String
-extern "C" def str_concat(a: String, b: String) -> String
+extern "C" def str_concat(a: &String, b: &String) -> String
+extern "C" def str_clone(s: &String) -> String
+extern "C" def gc_collect_now() -> Unit
+extern "C" def gc_live() -> Int
 
 trait Show
   def to_s(&self) -> String
+  def inspect(&self) -> String
+    self.to_s
+  end
 end
 
 trait Eq
-  def eq(&self, other: Self) -> Bool
+  def eq(&self, other: &Self) -> Bool
+end
+
+trait Clone
+  def clone(&self) -> Self
+end
+
+trait Copy: Clone
+end
+
+trait Drop
+  def drop(&mut self) -> Unit
 end
 
 enum Option[T]
@@ -38,7 +55,10 @@ end
 
 impl Show for String
   def to_s(&self)
-    self
+    self.clone
+  end
+  def inspect(&self)
+    "\"#{self}\""
   end
 end
 
@@ -58,41 +78,101 @@ impl[T: Show] Show for Option[T]
 end
 
 impl Eq for Int
-  def eq(&self, other: Int)
+  def eq(&self, other: &Int)
     self == other
   end
 end
 
 impl Eq for Float
-  def eq(&self, other: Float)
+  def eq(&self, other: &Float)
     self == other
   end
 end
 
 impl Eq for String
-  def eq(&self, other: String)
+  def eq(&self, other: &String)
     self == other
   end
 end
 
 impl Eq for Bool
-  def eq(&self, other: Bool)
+  def eq(&self, other: &Bool)
     self == other
   end
 end
 
 impl Eq for Unit
-  def eq(&self, other: Unit)
+  def eq(&self, other: &Unit)
     true
   end
 end
 
 impl[T: Eq] Eq for Option[T]
-  def eq(&self, other: Option[T])
+  def eq(&self, other: &Option[T])
     case (self, other)
     in (Some(a), Some(b)) then a == b
     in (None, None) then true
     in (_, _) then false
     end
   end
+end
+
+impl Clone for Int
+  def clone(&self)
+    *self
+  end
+end
+
+impl Copy for Int
+end
+
+impl Clone for Float
+  def clone(&self)
+    *self
+  end
+end
+
+impl Copy for Float
+end
+
+impl Clone for Bool
+  def clone(&self)
+    *self
+  end
+end
+
+impl Copy for Bool
+end
+
+impl Clone for Unit
+  def clone(&self)
+    ()
+  end
+end
+
+impl Copy for Unit
+end
+
+impl Clone for String
+  def clone(&self)
+    str_clone(self)
+  end
+end
+
+impl[T: Clone] Clone for Option[T]
+  def clone(&self)
+    case self
+    in Some(v) then Some(v.clone)
+    in None then None
+    end
+  end
+end
+
+impl[T] Clone for Gc[T]
+  def clone(&self)
+    *self
+  end
+end
+
+impl[T] Copy for Gc[T]
 end

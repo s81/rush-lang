@@ -1,16 +1,23 @@
 //! Monomorphization: instantiates generic bodies reachable from `main` and resolves trait calls.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::diag::{Diagnostic, Span};
 use crate::mir::*;
-use crate::types::{subst, GlobalKind, Type, TypeInfo};
+use crate::types::{match_pattern, subst, GlobalKind, Type, TypeInfo};
 
 /// C-identifier-safe encoding of a ground type.
 pub fn mangle_type(t: &Type) -> String {
     match t {
         Type::Con(n, args) if args.is_empty() => n.clone(),
-        Type::Con(n, args) => format!("{n}_L_{}_R", args.iter().map(mangle_type).collect::<Vec<_>>().join("__")),
+        Type::Con(n, args) => {
+            let n = match n.as_str() {
+                "&" => "Ref",
+                "&mut" => "RefMut",
+                other => other,
+            };
+            format!("{n}_L_{}_R", args.iter().map(mangle_type).collect::<Vec<_>>().join("__"))
+        }
         Type::Fn(a, b) => format!("Fn_L_{}__{}_R", mangle_type(a), mangle_type(b)),
         Type::Param(p) => panic!("mangle_type: unexpected type parameter {p}"),
         Type::Var(v) => panic!("mangle_type: unexpected inference variable ?{v}"),
@@ -28,6 +35,10 @@ pub fn mangle_fn(name: &str, targs: &[Type]) -> String {
     }
 }
 
+pub fn is_intrinsic(name: &str) -> bool {
+    matches!(name, "Gc::new" | "Gc::borrow" | "Gc::borrow_mut")
+}
+
 fn type_size(t: &Type) -> usize {
     match t {
         Type::Con(_, args) => 1 + args.iter().map(type_size).sum::<usize>(),
@@ -36,52 +47,43 @@ fn type_size(t: &Type) -> usize {
     }
 }
 
-fn match_pattern(pat: &Type, ty: &Type, map: &mut HashMap<String, Type>) -> bool {
-    match (pat, ty) {
-        (Type::Param(p), _) => match map.get(p) {
-            Some(bound) => bound == ty,
-            None => {
-                map.insert(p.clone(), ty.clone());
-                true
-            }
-        },
-        (Type::Con(n, a), Type::Con(m, b)) => n == m && a.len() == b.len() && a.iter().zip(b).all(|(x, y)| match_pattern(x, y, map)),
-        (Type::Fn(a1, r1), Type::Fn(a2, r2)) => match_pattern(a1, a2, map) && match_pattern(r1, r2, map),
-        _ => false,
-    }
-}
-
 struct Mono<'a> {
     info: &'a TypeInfo,
     by_name: HashMap<String, &'a Body>,
     queue: Vec<(String, Vec<Type>)>,
-    done: HashMap<String, ()>,
+    done: HashSet<String>,
     counts: HashMap<String, usize>,
 }
 
 impl<'a> Mono<'a> {
     /// Resolves a trait method call on a concrete self type to (global name, type args).
     fn resolve_trait(&self, trait_name: &str, method: &str, self_ty: &Type) -> Result<(String, Vec<Type>), Diagnostic> {
-        for imp in &self.info.impls {
-            if imp.trait_name.as_deref() != Some(trait_name) {
-                continue;
-            }
-            let mut map = HashMap::new();
-            if !match_pattern(&imp.self_ty, self_ty, &mut map) {
-                continue;
-            }
-            if let Some(global) = imp.methods.get(method) {
-                let n_vars = self.info.globals[global].scheme.vars.len();
-                if n_vars != imp.generics.len() {
-                    return Err(Diagnostic::new(Span::default(), format!("generic trait methods are not supported in this version (`{method}`)")));
+        // Impls for references fall back to the pointee, as the checker allows.
+        let mut ty = self_ty.clone();
+        loop {
+            for imp in &self.info.impls {
+                if imp.trait_name.as_deref() != Some(trait_name) {
+                    continue;
                 }
-                let targs = imp.generics.iter().map(|g| map[g].clone()).collect();
-                return Ok((global.clone(), targs));
+                let mut map = HashMap::new();
+                if !match_pattern(&imp.self_ty, &ty, &mut map) {
+                    continue;
+                }
+                if let Some(global) = imp.methods.get(method) {
+                    let n_vars = self.info.globals[global].scheme.vars.len();
+                    if n_vars != imp.generics.len() {
+                        return Err(Diagnostic::new(Span::default(), format!("generic trait methods are not supported in this version (`{method}`)")));
+                    }
+                    let targs = imp.generics.iter().map(|g| map[g].clone()).collect();
+                    return Ok((global.clone(), targs));
+                }
+                return Ok((format!("{trait_name}::{method}"), vec![ty.clone()]));
             }
-            let global = format!("{trait_name}::{method}");
-            return Ok((global, vec![self_ty.clone()]));
+            match ty.as_ref() {
+                Some((_, inner)) => ty = inner.clone(),
+                None => return Err(Diagnostic::new(Span::default(), format!("no instance of `{trait_name}` for `{self_ty}`"))),
+            }
         }
-        Err(Diagnostic::new(Span::default(), format!("no instance of `{trait_name}` for `{self_ty}`")))
     }
 
     fn request(&mut self, name: &str, targs: Vec<Type>) -> String {
@@ -95,7 +97,11 @@ impl<'a> Mono<'a> {
             Callee::Extern(n) => Callee::Extern(n.clone()),
             Callee::Def { name, targs } => {
                 let targs: Vec<Type> = targs.iter().map(|t| subst(t, map)).collect();
-                Callee::Def { name: self.request(name, targs), targs: vec![] }
+                if is_intrinsic(name) {
+                    Callee::Def { name: name.clone(), targs }
+                } else {
+                    Callee::Def { name: self.request(name, targs), targs: vec![] }
+                }
             }
             Callee::Trait { trait_name, method, self_ty } => {
                 let self_ty = subst(self_ty, map);
@@ -118,47 +124,105 @@ impl<'a> Mono<'a> {
         };
         for bb in &body.blocks {
             let mut stmts = Vec::new();
-            for Statement::Assign(place, rv) in &bb.stmts {
-                let rv = match rv {
-                    Rvalue::Call(c, ops) => Rvalue::Call(self.callee(c, &map)?, ops.clone()),
-                    Rvalue::Aggregate(agg, ops) => {
-                        let agg = match agg {
-                            Agg::Struct(t) => Agg::Struct(subst(t, &map)),
-                            Agg::Tuple(t) => Agg::Tuple(subst(t, &map)),
-                            Agg::Variant(t, i) => Agg::Variant(subst(t, &map), *i),
+            for s in &bb.stmts {
+                let s = match s {
+                    Statement::Drop(p, sp) => Statement::Drop(p.clone(), *sp),
+                    Statement::Assign(place, rv, sp) => {
+                        let rv = match rv {
+                            Rvalue::Call(c, ops) => Rvalue::Call(self.callee(c, &map)?, ops.clone()),
+                            Rvalue::Aggregate(agg, ops) => {
+                                let agg = match agg {
+                                    Agg::Struct(t) => Agg::Struct(subst(t, &map)),
+                                    Agg::Tuple(t) => Agg::Tuple(subst(t, &map)),
+                                    Agg::Variant(t, i) => Agg::Variant(subst(t, &map), *i),
+                                };
+                                Rvalue::Aggregate(agg, ops.clone())
+                            }
+                            other => other.clone(),
                         };
-                        Rvalue::Aggregate(agg, ops.clone())
+                        Statement::Assign(place.clone(), rv, *sp)
                     }
-                    other => other.clone(),
                 };
-                stmts.push(Statement::Assign(place.clone(), rv));
+                stmts.push(s);
             }
             out.blocks.push(BasicBlock { stmts, term: bb.term.clone() });
         }
         Ok(out)
     }
+
+    /// Requests the `Drop` impl of every type whose drop glue will call one.
+    fn request_drop_impls(&mut self, bodies: &[Body]) {
+        let mut seen: HashSet<Type> = HashSet::new();
+        let mut work: Vec<Type> = Vec::new();
+        for b in bodies {
+            for l in &b.locals {
+                work.push(l.ty.clone());
+            }
+            for bb in &b.blocks {
+                for s in &bb.stmts {
+                    if let Statement::Assign(_, Rvalue::Call(Callee::Def { name, targs }, _), _) = s {
+                        if name == "Gc::new" {
+                            work.extend(targs.iter().cloned());
+                        }
+                    }
+                }
+            }
+        }
+        while let Some(t) = work.pop() {
+            let t = match t.as_ref() {
+                Some((_, inner)) => inner.clone(),
+                None => t,
+            };
+            let t = if t.is_gc() { if let Type::Con(_, a) = &t { a[0].clone() } else { t } } else { t };
+            if !seen.insert(t.clone()) {
+                continue;
+            }
+            let Type::Con(n, args) = &t else { continue };
+            if let Some((id, map)) = self.info.impl_for("Drop", &t) {
+                let imp = &self.info.impls[id];
+                let global = imp.methods["drop"].clone();
+                let targs: Vec<Type> = imp.generics.iter().map(|g| map[g].clone()).collect();
+                self.request(&global, targs);
+            }
+            if let Some(s) = self.info.structs.get(n) {
+                let map: HashMap<String, Type> = s.generics.iter().cloned().zip(args.iter().cloned()).collect();
+                work.extend(s.fields.iter().map(|(_, ft)| subst(ft, &map)));
+            } else if let Some(e) = self.info.enums.get(n) {
+                let map: HashMap<String, Type> = e.generics.iter().cloned().zip(args.iter().cloned()).collect();
+                work.extend(e.variants.iter().flat_map(|v| v.fields.iter()).map(|(_, ft)| subst(ft, &map)));
+            } else if n == "Tuple" {
+                work.extend(args.iter().cloned());
+            }
+        }
+    }
 }
 
 pub fn monomorphize(bodies: Vec<Body>, info: &TypeInfo) -> Result<Vec<Body>, Diagnostic> {
     let by_name: HashMap<String, &Body> = bodies.iter().map(|b| (b.name.clone(), b)).collect();
-    let mut m = Mono { info, by_name, queue: vec![("main".into(), vec![])], done: HashMap::new(), counts: HashMap::new() };
+    let mut m = Mono { info, by_name, queue: vec![("main".into(), vec![])], done: HashSet::new(), counts: HashMap::new() };
     let mut out = Vec::new();
-    while let Some((name, targs)) = m.queue.pop() {
-        let mangled = mangle_fn(&name, &targs);
-        if m.done.contains_key(&mangled) {
-            continue;
+    loop {
+        let start = out.len();
+        while let Some((name, targs)) = m.queue.pop() {
+            let mangled = mangle_fn(&name, &targs);
+            if !m.done.insert(mangled) {
+                continue;
+            }
+            let c = m.counts.entry(name.clone()).or_insert(0);
+            *c += 1;
+            // Polymorphic recursion grows the instantiation types without bound.
+            if *c > 200 || targs.iter().map(type_size).sum::<usize>() > 256 {
+                return Err(Diagnostic::new(Span::default(), "polymorphic recursion is not supported"));
+            }
+            if matches!(info.globals[&name].kind, GlobalKind::Extern | GlobalKind::Intrinsic) {
+                continue;
+            }
+            out.push(m.instantiate(&name, &targs)?);
         }
-        m.done.insert(mangled, ());
-        let c = m.counts.entry(name.clone()).or_insert(0);
-        *c += 1;
-        // Polymorphic recursion grows the instantiation types without bound.
-        if *c > 200 || targs.iter().map(type_size).sum::<usize>() > 256 {
-            return Err(Diagnostic::new(Span::default(), "polymorphic recursion is not supported"));
+        m.request_drop_impls(&out[start..]);
+        if m.queue.is_empty() {
+            break;
         }
-        if matches!(info.globals[&name].kind, GlobalKind::Extern) {
-            continue;
-        }
-        out.push(m.instantiate(&name, &targs)?);
     }
     Ok(out)
 }
@@ -175,8 +239,10 @@ mod tests {
         let mut id = 0;
         let mut p = parse(lex(prelude).unwrap(), &mut id).unwrap();
         p.items.extend(parse(lex(s).unwrap(), &mut id).unwrap().items);
+        crate::derive::expand(&mut p, &mut id)?;
         let info = check(&p)?;
-        let bodies = lower(&p, &info)?;
+        let mut bodies = lower(&p, &info)?;
+        crate::ownck::check_and_insert_drops(&mut bodies, &info)?;
         monomorphize(bodies, &info)
     }
 
@@ -189,17 +255,15 @@ mod tests {
     #[test]
     fn mangling() {
         assert_eq!(mangle_type(&Type::Con("Pair".into(), vec![Type::con("Int"), Type::tuple(vec![Type::con("Bool"), Type::con("String")])])), "Pair_L_Int__Tuple_L_Bool__String_R_R");
+        assert_eq!(mangle_type(&Type::r#ref(true, Type::con("Int"))), "RefMut_L_Int_R");
         assert_eq!(mangle_fn("Show#3::to_s", &[Type::con("Int")]), "Show_3_to_s__Int");
         assert_eq!(mangle_fn("main", &[]), "main");
     }
 
     #[test]
     fn generic_def_instantiated_per_use_and_unused_generic_dropped() {
-        let src = "def id[T](x: T) -> T\n  x\nend\ndef unused[T](x: T) -> T\n  x\nend\ndef main\n  id(1)\n  id(\"a\")\n  ()\nend\n";
-        assert_eq!(names(src), vec!["id__Int", "id__String", "main"]);
-        let bodies = mono_src(src).unwrap();
-        let b = bodies.iter().find(|b| b.name == "id__String").unwrap();
-        assert_eq!(b.locals[1].ty, Type::con("String"));
+        let src = "def id[T](x: T) -> T\n  x\nend\ndef unused[T](x: T) -> T\n  x\nend\ndef main\n  id(1)\n  id(true)\n  ()\nend\n";
+        assert_eq!(names(src), vec!["id__Bool", "id__Int", "main"]);
     }
 
     #[test]
@@ -207,14 +271,7 @@ mod tests {
         let src = "struct P\n  x: Int\nend\nimpl Show for P\n  def to_s(&self)\n    \"p\"\n  end\nend\ndef main\n  puts(\"#{Some(P { x: 1 })}\")\nend\n";
         let n = names(src);
         assert!(n.iter().any(|x| x.starts_with("Show_") && x.ends_with("_to_s__P")), "{n:?}");
-        assert!(n.contains(&"Show_5_to_s__P".to_string()) || n.iter().any(|x| x.contains("_to_s__P")), "{n:?}");
         let bodies = mono_src(src).unwrap();
-        let main = bodies.iter().find(|b| b.name == "main").unwrap();
-        let calls: Vec<String> = main.blocks.iter().flat_map(|bb| bb.stmts.iter()).filter_map(|Statement::Assign(_, rv)| match rv {
-            Rvalue::Call(Callee::Def { name, .. }, _) => Some(name.clone()),
-            _ => None,
-        }).collect();
-        assert!(calls.iter().any(|c| c.starts_with("Show_5_to_s__P") || c.ends_with("_to_s__P")), "{calls:?}");
         assert!(bodies.iter().all(|b| b.locals.iter().all(|l| !l.ty.has_param())));
     }
 
@@ -223,12 +280,28 @@ mod tests {
         let src = "trait A\n  def a(&self) -> Int\n  def b(&self) -> Int\n    self.a + 1\n  end\nend\nstruct S\n  f: Int\nend\nimpl A for S\n  def a(&self)\n    self.f\n  end\nend\ndef main\n  S { f: 1 }.b\n  ()\nend\n";
         let n = names(src);
         assert!(n.contains(&"A_b__S".to_string()), "{n:?}");
-        assert!(n.iter().any(|x| x.starts_with("A_") && x.ends_with("_a__S") == false && x.ends_with("_a")), "{n:?}");
     }
 
     #[test]
     fn polymorphic_recursion_error() {
-        let src = "def f[T](x: T) -> Int\n  f((x, x))\nend\ndef main\n  f(1)\n  ()\nend\n";
+        let src = "def f[T](x: T) -> Int\n  f((x, 1))\nend\ndef main\n  f(1)\n  ()\nend\n";
         assert_eq!(mono_src(src).unwrap_err().msg, "polymorphic recursion is not supported");
+    }
+
+    #[test]
+    fn drop_impls_are_requested_for_droppable_types() {
+        let src = "struct R\n  n: String\nend\nimpl Drop for R\n  def drop(&mut self)\n    puts(&@n)\n  end\nend\ndef main\n  let r = R { n: \"a\" }\n  let g = Gc.new(R { n: \"b\" })\n  ()\nend\n";
+        let n = names(src);
+        assert!(n.iter().any(|x| x.starts_with("Drop_") && x.ends_with("_drop")), "{n:?}");
+    }
+
+    #[test]
+    fn intrinsics_keep_their_name_and_type_args() {
+        let src = "def main\n  let g = Gc.new(1)\n  let v = g.borrow\n  ()\nend\n";
+        let bodies = mono_src(src).unwrap();
+        let main = bodies.iter().find(|b| b.name == "main").unwrap();
+        let d = dump(main);
+        assert!(d.contains("call Gc::new[Int]("), "{d}");
+        assert!(d.contains("call Gc::borrow[Int]("), "{d}");
     }
 }

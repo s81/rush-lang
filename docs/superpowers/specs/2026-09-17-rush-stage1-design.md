@@ -34,6 +34,14 @@ Stage 1 delivers the Rust-hosted compiler that compiles and runs real single-thr
 | FP features | First-class closures, `\|>`, auto-currying, Functor/Applicative/Monad in stdlib |
 | Name | Rush, `.rush` files, `rush` CLI |
 | Architecture | Typed AST plus a small MIR, borrow checking with non-lexical lifetimes |
+| Gc syntax | `Gc.new(v)`; `Type.function(args)` calls associated functions in general |
+| Copies | Explicit `.clone` through `Clone`; use after move is an error |
+| Call borrows | Named variables need `&x`; temporaries and method receivers auto-borrow |
+| String operators | `+`, `==`, `!=` borrow both operands; `Eq::eq` takes `&Self` |
+| Match ergonomics | `case` on `&T` matches the pointee and binds by reference; `&T` with `T: Copy` reads as `T` |
+| Drops | At function exit and on reassignment (scope-exit drops in 3b) |
+| Literals | String literals are owned `String`s with static storage |
+| Derived Show | Uses `Show.inspect`, which quotes strings; `to_s` does not |
 
 ## 1. Language surface
 
@@ -202,7 +210,8 @@ Stage 1 is done when the section 6 suite passes on Windows with `tcc`, and the g
 |---|---|
 | 1 | Pipeline end to end, primitives, functions, control flow, CLI, golden tests (shipped) |
 | 2 | `struct`, `enum`, `case`/`in` with exhaustiveness, tuples, generics with monomorphization, traits with default methods and supertraits, `Show` interpolation, `Eq` (shipped) |
-| 3 | Ownership: moves, `Copy`, `&`/`&mut`, NLL borrow checker, drop insertion, `Gc[T]`, the GC, `derive` |
+| 3a | Ownership: moves, `Copy`/`Clone`/`Drop`, `derive`, drop insertion with flags, references as pointers with auto-ref/auto-deref, `Gc[T]` and the conservative collector, associated functions, debug overflow checks (shipped) |
+| 3b | NLL borrow checker: conflicts, liveness, lifetime elision for returned references, references in fields, `Gc` runtime exclusivity, scope-exit drops |
 | 4 | Closures and blocks, `move`, currying and partial application, `\|>`, `?`, `>>=`, `mdo`, `for`, `loop`, ranges, symbols, higher-kinded traits (Functor/Applicative/Monad) |
 | 5 | Stdlib (`List`, `Map`, `StringBuilder`, `Iterator` with associated types, `Ord`, IO), list patterns, `Char`, sized integers, `import`, `rush test`, Linux/macOS verification |
 
@@ -212,8 +221,11 @@ Stage 1 is done when the section 6 suite passes on Windows with `tcc`, and the g
 - No trait objects; all polymorphism is static.
 - No paren-less command calls.
 - Conservative GC may retain garbage that a stack word happens to resemble.
+- When several `Gc` objects die in one collection, a `Drop` that reads another of them sees it already dropped (its strings empty); nothing is freed until every drop has run.
 - No package manager or multi-directory modules.
-- Until Plan 3, `&T`, `&mut T`, `&e`, and `*e` parse and are erased.
+- Until Plan 3b, borrows are not checked for conflicts or lifetimes; references cannot appear in fields or return types; `Gc.borrow_mut` has no runtime exclusivity check; drops run at function exit rather than scope exit.
+- Moving a field out of a struct is only possible by destructuring the whole value in a pattern (`let Pair { first: a, second: b } = p`), never by `p.first` alone.
+- Field names cannot be keywords (`next`, `in`, `type`, ...).
 - Trait method signatures and inherent methods must annotate parameters; a trait impl method may omit types and take them from the trait. A trait signature without a return type returns `Unit`.
 - Generic trait methods (a method with its own type parameters) are rejected at monomorphization until a plan needs them.
 - Unannotated mutually recursive functions are inferred monomorphically within their group.

@@ -4,8 +4,9 @@ end
 
 def main
   let t = pair_up(1, "one")
+  puts("#{t.0} #{t.1}")
   let (n, s) = t
-  puts("#{t.0} #{s} #{n == 1}")
+  puts("#{n} #{s} #{n == 1}")
   case (n, pair_up(true, 2.5))
   in (1, (true, f)) if f > 2.0 then puts("big #{f}")
   in (1, (true, f)) then puts("small #{f}")

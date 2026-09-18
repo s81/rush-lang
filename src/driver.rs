@@ -1,7 +1,7 @@
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
-use crate::{cgen, diag, lexer, mir, mono, parser, types};
+use crate::{cgen, derive, diag, lexer, mir, mono, ownck, parser, types};
 
 const PRELUDE: &str = include_str!("../std/prelude.rush");
 const RT_C: &str = include_str!("../runtime/rush_rt.c");
@@ -19,15 +19,17 @@ pub fn main(args: Vec<String>) -> i32 {
 }
 
 /// Runs the whole front end and returns C source, or a rendered diagnostic.
-pub fn compile_to_c(path: &str, src: &str) -> Result<String, String> {
+pub fn compile_to_c(path: &str, src: &str, debug: bool) -> Result<String, String> {
     let go = || -> Result<String, diag::Diagnostic> {
         let mut id = 0;
         let mut prog = parser::parse(lexer::lex(PRELUDE)?, &mut id)?;
         prog.items.extend(parser::parse(lexer::lex(src)?, &mut id)?.items);
+        derive::expand(&mut prog, &mut id)?;
         let info = types::check(&prog)?;
-        let bodies = mir::lower(&prog, &info)?;
+        let mut bodies = mir::lower(&prog, &info)?;
+        ownck::check_and_insert_drops(&mut bodies, &info)?;
         let bodies = mono::monomorphize(bodies, &info)?;
-        Ok(cgen::gen(&bodies, &info))
+        Ok(cgen::gen(&bodies, &info, debug))
     };
     go().map_err(|d| diag::render(path, src, &d))
 }
@@ -66,7 +68,7 @@ fn build(args: &[String], run: bool) -> i32 {
             return 2;
         }
     };
-    let c = match compile_to_c(path, &src) {
+    let c = match compile_to_c(path, &src, debug) {
         Ok(c) => c,
         Err(msg) => {
             eprint!("{msg}");

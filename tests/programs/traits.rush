@@ -18,14 +18,14 @@ impl Named for Dog
   end
 end
 
-def introduce[T: Named](x: T) -> String
+def introduce[T: Named](x: &T) -> String
   "#{x.name} is #{x}"
 end
 
 def twice(x)
-  introduce(x) + " / " + introduce(x)
+  introduce(&x) + " / " + introduce(&x)
 end
 
 def main
-  puts(twice(Dog { age: 3 }))
+  puts(&twice(Dog { age: 3 }))
 end
