@@ -23,8 +23,9 @@ pub struct Body {
     pub locals: Vec<Local>,
     pub n_params: usize,
     pub blocks: Vec<BasicBlock>,
-    /// A closure body's captured names, in environment order (`_1` is the environment).
-    pub captures: Vec<String>,
+    /// A closure body's captures in environment order (`_1` is the environment): the name,
+    /// and whether the variable is reached through the field's reference (`*(*_1).k`).
+    pub captures: Vec<(String, bool)>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -224,13 +225,30 @@ impl Emit {
 
 /// Source-like path of a place for messages: `p.name`, `t.0`, `*r`. Field access through a
 /// reference is shown auto-dereferenced, as it is written.
+/// The capture a place in a closure body starts with: its name and how many projections
+/// (`(*_1).k`, plus the implicit `*` of a reference capture) reach the variable.
+pub fn capture_of(info: &TypeInfo, body: &Body, p: &Place) -> Option<(String, usize)> {
+    if p.local != 1 || !matches!(info.globals.get(&body.name).map(|g| &g.kind), Some(GlobalKind::Closure { .. })) {
+        return None;
+    }
+    let [Proj::Deref, Proj::Field(k), ..] = p.proj.as_slice() else { return None };
+    let (name, by_ref) = body.captures[*k].clone();
+    let skip = if by_ref { 3 } else { 2 };
+    Some((name, skip.min(p.proj.len())))
+}
+
 pub fn describe_place(info: &TypeInfo, body: &Body, p: &Place) -> String {
     let mut s = body.locals[p.local as usize].name.clone();
     if s.is_empty() || s == "_ret" {
         s = "value".into();
     }
-    let mut ty = body.locals[p.local as usize].ty.clone();
-    for (i, pr) in p.proj.iter().enumerate() {
+    let mut start = 0;
+    if let Some((name, skip)) = capture_of(info, body, p) {
+        s = name;
+        start = skip;
+    }
+    let mut ty = place_type(info, body, &Place { local: p.local, proj: p.proj[..start].to_vec() });
+    for (i, pr) in p.proj.iter().enumerate().skip(start) {
         let name = |fields: Option<&str>, k: usize| fields.map(str::to_string).unwrap_or(k.to_string());
         match pr {
             Proj::Deref if i + 1 == p.proj.len() => s = format!("*{s}"),
@@ -830,7 +848,7 @@ impl<'a> Lowerer<'a> {
                 locals: vec![Local { name: "_ret".into(), ty: ci.ret.clone() }],
                 n_params: 1 + ci.params.len(),
                 blocks: vec![BasicBlock { stmts: vec![], term: Terminator::Unreachable }],
-                captures: ci.captures.iter().map(|c| c.name.clone()).collect(),
+                captures: ci.captures.iter().map(|c| (c.name.clone(), matches!(c.mode, CaptureMode::Shared | CaptureMode::Mut))).collect(),
             },
             cur: 0,
             scopes: vec![HashMap::new()],
@@ -845,8 +863,10 @@ impl<'a> Lowerer<'a> {
         };
         let env = l.new_local("env", ci.env_type());
         for (k, c) in ci.captures.iter().enumerate() {
+            // `&`/`&mut` captures store a reference to the variable; a reborrowed `&mut T`
+            // variable and a moved one are the field itself.
             let place = Place::local(env).deref().field(k);
-            let place = if c.mode == CaptureMode::Move { place } else { place.deref() };
+            let place = if matches!(c.mode, CaptureMode::Shared | CaptureMode::Mut) { place.deref() } else { place };
             l.captured.insert(c.name.clone(), place);
         }
         if params.is_empty() {

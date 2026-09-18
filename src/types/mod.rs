@@ -432,12 +432,18 @@ impl TypeInfo {
 
     /// Whether a value of `t` may hold a reference (and so carries loans).
     pub fn contains_ref(&self, t: &Type) -> bool {
-        self.contains_in(t, &|t| matches!(t, Type::Con(n, _) if n == "&" || n == "&mut"), &mut Vec::new())
+        self.contains_in(t, &|t| matches!(t, Type::Con(n, _) if n == "&" || n == "&mut"), true, &mut Vec::new())
     }
 
     /// Whether `t` holds a function value anywhere, including behind references.
     pub fn contains_fn(&self, t: &Type) -> bool {
-        self.contains_in(t, &|t| matches!(t, Type::Fn(..)), &mut Vec::new())
+        self.contains_in(t, &|t| matches!(t, Type::Fn(..)), true, &mut Vec::new())
+    }
+
+    /// Whether `t` holds a function value that is not behind a reference: a value of `t`
+    /// may be stored or returned by whoever receives it.
+    pub fn holds_owned_fn(&self, t: &Type) -> bool {
+        self.contains_in(t, &|t| matches!(t, Type::Fn(..)), false, &mut Vec::new())
     }
 
     /// Whether values of `t` may carry loans: references, or function values (closures and
@@ -447,12 +453,16 @@ impl TypeInfo {
     }
 
     /// Whether `t` or a component of it (fields and variants, after substitution) is a `leaf`.
-    fn contains_in(&self, t: &Type, leaf: &dyn Fn(&Type) -> bool, visiting: &mut Vec<Type>) -> bool {
+    /// `through_refs` also looks behind `&` and `&mut`.
+    fn contains_in(&self, t: &Type, leaf: &dyn Fn(&Type) -> bool, through_refs: bool, visiting: &mut Vec<Type>) -> bool {
         if leaf(t) {
             return true;
         }
         let Type::Con(n, args) = t else { return false };
-        if args.iter().any(|a| self.contains_in(a, leaf, visiting)) {
+        if !through_refs && (n == "&" || n == "&mut") {
+            return false;
+        }
+        if args.iter().any(|a| self.contains_in(a, leaf, through_refs, visiting)) {
             return true;
         }
         if visiting.contains(t) {
@@ -468,7 +478,7 @@ impl TypeInfo {
         } else {
             vec![]
         };
-        let r = fields.iter().any(|f| self.contains_in(f, leaf, visiting));
+        let r = fields.iter().any(|f| self.contains_in(f, leaf, through_refs, visiting));
         visiting.pop();
         r
     }
