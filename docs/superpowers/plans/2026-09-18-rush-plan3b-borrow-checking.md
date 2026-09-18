@@ -77,6 +77,7 @@ end
 
   Two places overlap when one's projection list is a prefix of the other's. `x` in messages is the source path (`p.name`), rendered by a shared `describe_place` that names fields, not indexes. Every conflict carries the note "`x` is borrowed here" at the loan's span.
 - **Returns.** At `Return`, `_0` is live, and every local gets an implicit `StorageDead`. So `return &local` fails with "`local` does not live long enough". A returned value holding the entry loan of a parameter other than the elided one fails with "returned reference must borrow from `s`" (the elided parameter's name).
+- **Writes behind parameters.** A value assigned through a `Deref` of a local that holds a parameter's entry loan (`*out = Some(&local)`, `@items = ...` through `&mut self`) may carry only that same entry loan. Otherwise the error is "cannot store a borrowed value behind `out`; it may outlive the borrow". At a call site, the loans of every other argument flow into the place behind each `&mut` argument whose pointee contains a reference (a weak update of that loan's root local), so a generic `set(&mut o, &tmp)` ties `o` to `tmp`. This replaces the Plan 3a rejection of `&mut` parameters whose pointee holds references.
 - **Scope-exit drops.** A local is dropped when its scope ends (the end of an `if`/`else`/`while`/`case` arm body or the function), in reverse declaration order, if still owned. `return` drops everything still owned, in reverse declaration order. Reassignment still drops the old value first.
 - **Gc exclusivity.** The Gc header gets a borrow count: `0` free, `n > 0` shared, `-1` mutable. `g.borrow` panics with "Gc value is mutably borrowed" if the count is `-1`. `g.borrow_mut` panics with "Gc value is already borrowed" if the count is not `0`. The compiler releases each such borrow once the returned reference, and every value derived from it, is dead.
 
@@ -90,6 +91,7 @@ end
    - `Use`/`MoveOut`/`Aggregate`: the union over the operand locals;
    - `Call`: the union over the elided argument's locals (rule 4 above), plus `R_k` for `Gc` borrows;
    - anything else: empty.
+   - after a `Call`, for each argument holding a mutable loan `L` whose pointee type contains a reference: `holds[L.place.local] |= ` the loans of the other arguments.
 
    A whole-local target is a strong update (`holds[t] = loans(rv)`). A projected target is a weak update (`holds[t] |= loans(rv)`). Only locals whose type `contains_ref` are tracked. Merge is union.
 3. **Liveness (backward, may).** A local is used by any operand or place that reads it, by `Drop(x)` when `x`'s type needs drop glue, and by `Return` for `_0`. A whole-local assignment kills it. `StorageDead` neither uses nor kills.
@@ -176,7 +178,7 @@ The algorithm above, steps 1–5. Step 6 is Task 6.
 
 - [ ] Tests, each a small program checked for acceptance or its exact message:
   - accepted: NLL (`let r = &mut x; use(r); x = 1`); disjoint fields; two-phase `p.set_age(p.age + 1)`; reborrow `f(r); f(r)` with `r: &mut T`; returning `&self.field`; returning a parameter; storing `&s` in `Words` and reading through it; a loop that borrows each iteration;
-  - rejected: read while mutably borrowed; `&mut` while shared-borrowed; assign while borrowed; move while borrowed; `return &local`; a reference stored in a `Words` that outlives its scope; `&mut` alias through two `&mut` borrows kept live; returning the wrong parameter's reference.
+  - rejected: `*out = Some(&local)` and `*out = Some(other_param)` behind `out: &mut Option[&String]`; a generic `set(&mut o, &tmp)` with `o` outliving `tmp`; read while mutably borrowed; `&mut` while shared-borrowed; assign while borrowed; move while borrowed; `return &local`; a reference stored in a `Words` that outlives its scope; `&mut` alias through two `&mut` borrows kept live; returning the wrong parameter's reference.
 
   Commit `feat: NLL borrow checker`.
 
