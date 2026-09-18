@@ -221,6 +221,7 @@ Stage 1 is done when the section 6 suite passes on Windows with `tcc`, and the g
 - No trait objects; all polymorphism is static.
 - No paren-less command calls.
 - Conservative GC may retain garbage that a stack word happens to resemble.
+- When several `Gc` objects die in one collection, a `Drop` that reads another of them sees it already dropped (its strings empty); nothing is freed until every drop has run.
 - No package manager or multi-directory modules.
 - Until Plan 3b, borrows are not checked for conflicts or lifetimes; references cannot appear in fields or return types; `Gc.borrow_mut` has no runtime exclusivity check; drops run at function exit rather than scope exit.
 - Moving a field out of a struct is only possible by destructuring the whole value in a pattern (`let Pair { first: a, second: b } = p`), never by `p.first` alone.
