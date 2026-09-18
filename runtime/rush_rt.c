@@ -168,7 +168,8 @@ typedef struct rush_gc_hdr {
     rush_drop_fn drop;
     struct rush_gc_hdr *next;
     uint8_t mark;
-    uint8_t pad[7];
+    uint8_t pad[3];
+    int32_t borrows;             /* 0 free, n > 0 shared borrows, -1 mutably borrowed */
 } rush_gc_hdr;
 
 static rush_gc_hdr *gc_objects;
@@ -300,12 +301,32 @@ void *rush_gc_alloc(size_t size, rush_drop_fn drop) {
     h->size = size ? size : 1;
     h->drop = drop;
     h->mark = 0;
+    h->borrows = 0;
     h->next = gc_objects;
     gc_objects = h;
     gc_count++;
     gc_bytes_since += h->size;
     memset(h + 1, 0, h->size);
     return h + 1;
+}
+
+void *rush_gc_borrow(void *p) {
+    rush_gc_hdr *h = (rush_gc_hdr *)p - 1;
+    if (h->borrows < 0) rush_panic("Gc value is mutably borrowed");
+    h->borrows++;
+    return p;
+}
+
+void *rush_gc_borrow_mut(void *p) {
+    rush_gc_hdr *h = (rush_gc_hdr *)p - 1;
+    if (h->borrows != 0) rush_panic("Gc value is already borrowed");
+    h->borrows = -1;
+    return p;
+}
+
+void rush_gc_release(void *p, bool mut) {
+    rush_gc_hdr *h = (rush_gc_hdr *)p - 1;
+    h->borrows = mut ? 0 : h->borrows - 1;
 }
 
 int64_t rush_gc_live_objects(void) {

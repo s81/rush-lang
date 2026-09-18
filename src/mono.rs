@@ -36,7 +36,7 @@ pub fn mangle_fn(name: &str, targs: &[Type]) -> String {
 }
 
 pub fn is_intrinsic(name: &str) -> bool {
-    matches!(name, "Gc::new" | "Gc::borrow" | "Gc::borrow_mut")
+    matches!(name, "Gc::new" | "Gc::borrow" | "Gc::borrow_mut" | "Gc::release")
 }
 
 fn type_size(t: &Type) -> usize {

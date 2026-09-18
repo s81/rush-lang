@@ -451,7 +451,11 @@ fn check_body(body: &mut Body, info: &TypeInfo) -> Result<(), Diagnostic> {
         }
     }
 
-    // Check every reachable block.
+    // Check every reachable block, recording where each runtime (`Gc`) loan dies.
+    let is_rt = |l: usize| matches!(bc.loans[l].origin, Origin::Gc(_));
+    let mut start_live: Vec<Bits> = vec![Bits::new(n); nb];
+    let mut end_live: Vec<Bits> = vec![Bits::new(n); nb];
+    let mut dies_after: Vec<Vec<Vec<usize>>> = body.blocks.iter().map(|bb| vec![Vec::new(); bb.stmts.len()]).collect();
     for b in 0..nb {
         let Some(mut h) = holds_in[b].clone() else { continue };
         let bb = &body.blocks[b];
@@ -472,12 +476,23 @@ fn check_body(body: &mut Body, info: &TypeInfo) -> Result<(), Diagnostic> {
             }
             live_before[si] = live.clone();
         }
-        for (si, s) in bb.stmts.iter().enumerate() {
-            let mut live_loans = Bits::new(n);
-            for (l, &is_live) in live_before[si].iter().enumerate() {
+        let live_loans_of = |live: &[bool], h: &[Bits]| {
+            let mut out = Bits::new(n);
+            for (l, &is_live) in live.iter().enumerate() {
                 if is_live {
-                    live_loans.union(&h[l]);
+                    out.union(&h[l]);
                 }
+            }
+            out
+        };
+        let mut prev: Option<Bits> = None;
+        for (si, s) in bb.stmts.iter().enumerate() {
+            let live_loans = live_loans_of(&live_before[si], &h);
+            if si == 0 {
+                start_live[b] = live_loans.clone();
+            }
+            if let Some(p) = prev.take() {
+                dies_after[b][si - 1] = deaths(&p, bc.created.get(&(b, si - 1)), &live_loans, &is_rt);
             }
             let span = match s {
                 Statement::Assign(_, _, sp) | Statement::Drop(_, sp) | Statement::StorageDead(_, sp) => *sp,
@@ -489,14 +504,131 @@ fn check_body(body: &mut Body, info: &TypeInfo) -> Result<(), Diagnostic> {
                     }
                 }
             }
+            if let Some(&k) = bc.created.get(&(b, si)) {
+                if is_rt(k) && live_loans.contains(k) {
+                    return Err(Diagnostic::new(span, "this `Gc` borrow is still in use from an earlier loop iteration"));
+                }
+            }
             bc.step(&mut h, (b, si), s)?;
+            prev = Some(live_loans);
         }
+        let at_end = live_loans_of(&live_at_term, &h);
+        match prev {
+            Some(p) => {
+                let last = bb.stmts.len() - 1;
+                dies_after[b][last] = deaths(&p, bc.created.get(&(b, last)), &at_end, &is_rt);
+            }
+            None => start_live[b] = at_end.clone(),
+        }
+        end_live[b] = at_end;
         if matches!(bb.term, Terminator::Return) {
-            let _ = live_at_term;
             check_return(&bc, &h[0], bb)?;
         }
     }
+    let runtime: Vec<usize> = (0..n).filter(|&l| is_rt(l)).collect();
+    if runtime.is_empty() {
+        return Ok(());
+    }
+    // A runtime loan live at the end of a predecessor but not at a block's start dies on entry.
+    let mut dies_on_entry: Vec<Vec<usize>> = vec![Vec::new(); nb];
+    for b in 0..nb {
+        if holds_in[b].is_none() {
+            continue;
+        }
+        for succ in successors(&body.blocks[b].term) {
+            let succ = succ as usize;
+            for &k in &runtime {
+                if end_live[b].contains(k) && !start_live[succ].contains(k) && !dies_on_entry[succ].contains(&k) {
+                    dies_on_entry[succ].push(k);
+                }
+            }
+        }
+    }
+    let created: Vec<((usize, usize), usize)> = bc.created.iter().filter(|(_, &l)| is_rt(l)).map(|(&key, &l)| (key, l)).collect();
+    let mutable: HashMap<usize, bool> = runtime.iter().map(|&k| (k, matches!(bc.loans[k].origin, Origin::Gc(true)))).collect();
+    let spans: HashMap<usize, Span> = runtime.iter().map(|&k| (k, bc.loans[k].span)).collect();
+    insert_releases(body, info, &runtime, &created, &mutable, &spans, &dies_on_entry, &dies_after);
     Ok(())
+}
+
+/// Runtime loans live before a statement (or created by it) that are dead after it.
+fn deaths(before: &Bits, created: Option<&usize>, after: &Bits, is_rt: &dyn Fn(usize) -> bool) -> Vec<usize> {
+    let mut all = before.clone();
+    if let Some(&k) = created {
+        all.insert(k);
+    }
+    all.iter().filter(|&l| is_rt(l) && !after.contains(l)).collect()
+}
+
+/// Gives each `Gc` borrow a payload copy and a held flag, and releases it where its last holder
+/// dies and before every return.
+#[allow(clippy::too_many_arguments)]
+fn insert_releases(
+    body: &mut Body,
+    info: &TypeInfo,
+    runtime: &[usize],
+    created: &[((usize, usize), usize)],
+    mutable: &HashMap<usize, bool>,
+    spans: &HashMap<usize, Span>,
+    dies_on_entry: &[Vec<usize>],
+    dies_after: &[Vec<Vec<usize>>],
+) {
+    let mut ptr_of: HashMap<usize, LocalId> = HashMap::new();
+    let mut held_of: HashMap<usize, LocalId> = HashMap::new();
+    let mut target_of: HashMap<(usize, usize), (usize, Place)> = HashMap::new();
+    let unit = body.locals.len() as LocalId;
+    body.locals.push(Local { name: String::new(), ty: Type::unit() });
+    for &(key, k) in created {
+        let Statement::Assign(target, _, _) = &body.blocks[key.0].stmts[key.1] else { unreachable!() };
+        let ty = place_type(info, body, target);
+        target_of.insert(key, (k, target.clone()));
+        ptr_of.insert(k, body.locals.len() as LocalId);
+        body.locals.push(Local { name: "gc_borrow".into(), ty });
+        held_of.insert(k, body.locals.len() as LocalId);
+        body.locals.push(Local { name: "gc_borrow_held".into(), ty: Type::con("Bool") });
+    }
+    let set = |flag: LocalId, v: bool, span: Span| Statement::Assign(Place::local(flag), Rvalue::Use(Operand::Const(Const::Bool(v))), span);
+    let release = |k: usize, body: &Body| -> Vec<Statement> {
+        let p = ptr_of[&k];
+        let pointee = body.locals[p as usize].ty.as_ref().unwrap().1.clone();
+        let call = Rvalue::Call(Callee::Def { name: "Gc::release".into(), targs: vec![pointee] }, vec![Operand::local(p), Operand::Const(Const::Bool(mutable[&k]))]);
+        vec![Statement::Assign(Place::local(unit), call, spans[&k]), set(held_of[&k], false, spans[&k])]
+    };
+    let mut next = body.blocks.len() as BlockId;
+    let mut chunks = Vec::new();
+    for (b, bb) in body.blocks.iter().enumerate() {
+        let mut em = Emit { chunks: vec![], cur_id: b as BlockId, cur: vec![], next };
+        if b == 0 {
+            for &k in runtime {
+                em.cur.push(set(held_of[&k], false, spans[&k]));
+            }
+        }
+        for &k in &dies_on_entry[b] {
+            em.guarded(held_of[&k], release(k, body));
+        }
+        for (si, s) in bb.stmts.iter().enumerate() {
+            em.cur.push(s.clone());
+            if let Some((k, target)) = target_of.get(&(b, si)) {
+                em.cur.push(Statement::Assign(Place::local(ptr_of[k]), Rvalue::Use(Operand::Place(target.clone())), spans[k]));
+                em.cur.push(set(held_of[k], true, spans[k]));
+            }
+            for &k in dies_after[b].get(si).map(|v| v.as_slice()).unwrap_or(&[]) {
+                em.guarded(held_of[&k], release(k, body));
+            }
+        }
+        if matches!(bb.term, Terminator::Return) {
+            for &k in runtime {
+                em.guarded(held_of[&k], release(k, body));
+            }
+        }
+        next = em.next;
+        chunks.extend(em.finish(bb.term.clone()));
+    }
+    let mut blocks: Vec<BasicBlock> = (0..next).map(|_| BasicBlock { stmts: vec![], term: Terminator::Unreachable }).collect();
+    for (id, stmts, term) in chunks {
+        blocks[id as usize] = BasicBlock { stmts, term };
+    }
+    body.blocks = blocks;
 }
 
 /// At `Return` every local's storage ends while `_0` lives on in the caller.
@@ -511,6 +643,9 @@ fn check_return(bc: &Bc, ret_loans: &Bits, bb: &BasicBlock) -> Result<(), Diagno
             Origin::Place(p, _) if !p.proj.contains(&Proj::Deref) => {
                 let x = bc.name(&Place::local(p.local));
                 return Err(Diagnostic::new(bc.loans[l].span, format!("`{x}` does not live long enough; the returned value borrows it")));
+            }
+            Origin::Gc(_) => {
+                return Err(Diagnostic::new(span.unwrap_or_default(), "cannot return a reference obtained from a `Gc` borrow; its runtime borrow ends here"));
             }
             Origin::Entry(param) if Some(*param) != elided => {
                 let want = match elided {
@@ -598,6 +733,37 @@ mod tests {
         let msg = "cannot store a borrowed value behind `out`; it may outlive the borrow";
         assert_eq!(err(&format!("def f(out: &mut Option[&String])\n  let s = int_to_s(1)\n  *out = Some(&s)\nend\n{}", prog("  ()\n"))), msg);
         assert_eq!(err(&format!("def f(out: &mut Option[&String], s: &String)\n  *out = Some(s)\nend\n{}", prog("  ()\n"))), msg);
+    }
+
+    #[test]
+    fn gc_borrows_cannot_be_returned_or_overlap_across_iterations() {
+        let ret = format!("def name(g: &Gc[P]) -> &String
+  &g.borrow.name
+end
+{}", prog("  ()
+"));
+        assert_eq!(err(&ret), "cannot return a reference obtained from a `Gc` borrow; its runtime borrow ends here");
+        let lp = prog("  let g = Gc.new(1)
+  let mut last = g.borrow
+  let mut i = 0
+  while i < 2
+    let c = g.borrow
+    puts(&int_to_s(*last))
+    last = c
+    i += 1
+  end
+");
+        assert_eq!(err(&lp), "this `Gc` borrow is still in use from an earlier loop iteration");
+        ok(&prog("  let g = Gc.new(1)
+  let mut i = 0
+  while i < 2
+    let c = g.borrow
+    puts(&int_to_s(*c))
+    i += 1
+  end
+  let m = g.borrow_mut
+  *m = 2
+"));
     }
 
     #[test]

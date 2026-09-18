@@ -439,7 +439,14 @@ impl<'a> Gen<'a> {
                             }
                             Rvalue::Call(Callee::Def { name, .. }, ops) if name == "Gc::borrow" || name == "Gc::borrow_mut" => {
                                 let (g, _) = self.operand(b, &ops[0]);
-                                writeln!(c, "  {target} = *{g};").unwrap();
+                                let f = if name == "Gc::borrow" { "rush_gc_borrow" } else { "rush_gc_borrow_mut" };
+                                writeln!(c, "  {target} = {f}(*{g});").unwrap();
+                            }
+                            // Inserted by borrowck where a `Gc` borrow's last holder dies.
+                            Rvalue::Call(Callee::Def { name, .. }, ops) if name == "Gc::release" => {
+                                let (p, _) = self.operand(b, &ops[0]);
+                                let (m, _) = self.operand(b, &ops[1]);
+                                writeln!(c, "  rush_gc_release({p}, {m});").unwrap();
                             }
                             _ => {
                                 let _ = tty;
@@ -583,7 +590,7 @@ mod tests {
     fn gc_intrinsics_and_debug_arithmetic() {
         let c = gen_src_dbg("def main\n  let g = Gc.new(\"s\")\n  let r = g.borrow\n  let n = 1 + 2 * 3\n  ()\nend\n", true);
         assert!(c.contains("rush_gc_alloc(sizeof(rush_str), rush_drop_String)"), "{c}");
-        assert!(c.contains(" = *_"), "{c}");
+        assert!(c.contains(" = rush_gc_borrow(*_"), "{c}");
         assert!(c.contains("rush_add_i64_checked("), "{c}");
         assert!(c.contains("rush_mul_i64_checked("), "{c}");
         let c2 = gen_src("def main\n  let n = 1 + 2\n  ()\nend\n");
