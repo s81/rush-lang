@@ -171,6 +171,7 @@ impl<'a> Gen<'a> {
                             Rvalue::Aggregate(agg, _) => {
                                 let t = match agg {
                                     Agg::Struct(t) | Agg::Tuple(t) | Agg::Variant(t, _) => t,
+                                    Agg::Fn { .. } => continue,
                                 };
                                 self.collect_root(t, &mut order, &mut visiting);
                             }
@@ -411,6 +412,7 @@ impl<'a> Gen<'a> {
                 let name = match callee {
                     Callee::Def { name, .. } | Callee::Extern(name) => name,
                     Callee::Trait { .. } => panic!("cgen: unresolved trait call"),
+                    Callee::Value => unreachable!("mono rejects function values until Plan 4a Task 7"),
                 };
                 let args: Vec<String> = args.iter().map(|o| self.operand(b, o).0).collect();
                 format!("rush_{name}({})", args.join(", "))
@@ -445,6 +447,7 @@ impl<'a> Gen<'a> {
                             Rvalue::Aggregate(agg, ops) => {
                                 let ops: Vec<String> = ops.iter().map(|o| self.operand(b, o).0).collect();
                                 match agg {
+                                    Agg::Fn { .. } => unreachable!("mono rejects function values until Plan 4a Task 7"),
                                     Agg::Struct(t) | Agg::Tuple(t) => {
                                         let fields = self.fields(t);
                                         if fields.is_empty() {

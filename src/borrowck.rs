@@ -178,6 +178,8 @@ impl<'a> Bc<'a> {
                     let key_name = match c {
                         Callee::Def { name, .. } | Callee::Extern(name) => name.clone(),
                         Callee::Trait { trait_name, method, .. } => format!("{trait_name}::{method}"),
+                        // No elision for function values: every operand's loans flow in.
+                        Callee::Value => String::new(),
                     };
                     match self.info.elided.get(&key_name) {
                         Some(&i) => {

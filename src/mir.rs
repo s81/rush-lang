@@ -5,7 +5,7 @@ use std::fmt::Write;
 
 use crate::ast::*;
 use crate::diag::{Diagnostic, Span};
-use crate::types::{subst, Adjust, DotRes, GlobalKind, MethodRes, Type, TypeInfo};
+use crate::types::{subst, Adjust, CaptureMode, ClosureInfo, DotRes, GlobalKind, MethodRes, Type, TypeInfo};
 
 pub type LocalId = u32;
 pub type BlockId = u32;
@@ -23,6 +23,8 @@ pub struct Body {
     pub locals: Vec<Local>,
     pub n_params: usize,
     pub blocks: Vec<BasicBlock>,
+    /// A closure body's captured names, in environment order (`_1` is the environment).
+    pub captures: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -81,6 +83,28 @@ pub enum Agg {
     Struct(Type),
     Tuple(Type),
     Variant(Type, usize),
+    /// A function value; the operands are its environment (captures or bound arguments).
+    Fn { code: FnCode, alloc: Alloc },
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum FnCode {
+    /// Closure body `name`; the environment holds its captures.
+    Closure { name: String, targs: Vec<Type> },
+    /// A def, method, associated function, or trait method; the environment holds the first arguments.
+    Global(Callee),
+    /// A variant constructor of the enum type; the environment holds the first fields.
+    Variant(Type, usize),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Alloc {
+    /// Nothing captured or bound: one static object.
+    Static,
+    /// A borrowing closure: the environment lives in the creating function's frame.
+    Stack,
+    /// On the GC heap.
+    Heap,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -101,6 +125,9 @@ pub enum Callee {
     Def { name: String, targs: Vec<Type> },
     Extern(String),
     Trait { trait_name: String, method: String, self_ty: Type },
+    /// Calls the function value in the first operand (or behind it, for `&(A -> B)`) with the
+    /// rest. Fewer arguments than its arity make a partial application.
+    Value,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -233,18 +260,18 @@ pub fn lower(prog: &Program, info: &TypeInfo) -> Result<Vec<Body>, Diagnostic> {
     let mut out = Vec::new();
     for item in &prog.items {
         match item {
-            Item::Def(d) => out.push(lower_def(&d.name, d, info)?),
+            Item::Def(d) => out.extend(lower_def(&d.name, d, info)?),
             Item::Impl(imp) => {
                 let id = impl_index(prog, imp, info);
                 for m in &imp.methods {
                     let global = info.impls[id].methods.get(&m.name).or_else(|| info.impls[id].assoc.get(&m.name)).cloned().unwrap();
-                    out.push(lower_def(&global, m, info)?);
+                    out.extend(lower_def(&global, m, info)?);
                 }
             }
             Item::Trait(t) => {
                 for m in &t.methods {
                     if !m.body.stmts.is_empty() {
-                        out.push(lower_def(&format!("{}::{}", t.name, m.name), m, info)?);
+                        out.extend(lower_def(&format!("{}::{}", t.name, m.name), m, info)?);
                     }
                 }
             }
@@ -273,6 +300,10 @@ struct Lowerer<'a> {
     owned: Vec<Vec<LocalId>>,
     /// Enclosing loops, innermost last.
     loops: Vec<LoopCtx>,
+    /// In a closure body: captured name -> its place through the environment `_1`.
+    captured: HashMap<String, Place>,
+    /// Closure bodies lowered so far.
+    extra: Vec<Body>,
 }
 
 #[derive(Clone)]
@@ -285,7 +316,8 @@ struct LoopCtx {
     depth: usize,
 }
 
-fn lower_def(global: &str, d: &Def, info: &TypeInfo) -> Result<Body, Diagnostic> {
+/// The body of `d` followed by the bodies of its closures.
+fn lower_def(global: &str, d: &Def, info: &TypeInfo) -> Result<Vec<Body>, Diagnostic> {
     let g = &info.globals[global];
     let (params, ret) = g.scheme.ty.uncurry_n(g.n_params);
     let copy_params: Vec<String> = g.scheme.bounds.iter().filter(|(_, t)| info.trait_closure(t).iter().any(|x| x == "Copy")).map(|(p, _)| p.clone()).collect();
@@ -295,6 +327,7 @@ fn lower_def(global: &str, d: &Def, info: &TypeInfo) -> Result<Body, Diagnostic>
             locals: vec![Local { name: "_ret".into(), ty: ret }],
             n_params: params.len(),
             blocks: vec![BasicBlock { stmts: vec![], term: Terminator::Unreachable }],
+            captures: vec![],
         },
         cur: 0,
         scopes: vec![HashMap::new()],
@@ -304,6 +337,8 @@ fn lower_def(global: &str, d: &Def, info: &TypeInfo) -> Result<Body, Diagnostic>
         or_sel: HashMap::new(),
         owned: vec![vec![]],
         loops: vec![],
+        captured: HashMap::new(),
+        extra: vec![],
     };
     let mut params = params.into_iter();
     if d.self_param.is_some() {
@@ -317,7 +352,9 @@ fn lower_def(global: &str, d: &Def, info: &TypeInfo) -> Result<Body, Diagnostic>
     let v = l.block(&d.body)?;
     l.assign(0, Rvalue::Use(v));
     l.terminate(Terminator::Return);
-    Ok(l.body)
+    let mut out = vec![l.body];
+    out.extend(l.extra);
+    Ok(out)
 }
 
 impl<'a> Lowerer<'a> {
@@ -718,6 +755,115 @@ impl<'a> Lowerer<'a> {
         place.downcast(*idx, i)
     }
 
+    /// Place of local variable `n`: a local of this body, or a capture reached through `_1`.
+    fn var_place(&self, n: &str) -> Option<Place> {
+        match self.lookup(n) {
+            Some(id) => Some(Place::local(id)),
+            None => self.captured.get(n).cloned(),
+        }
+    }
+
+    /// Type of global `name` instantiated with `targs`.
+    fn instantiated(&self, name: &str, targs: &[Type]) -> Type {
+        let s = &self.info.globals[name].scheme;
+        let map: HashMap<String, Type> = s.vars.iter().cloned().zip(targs.iter().cloned()).collect();
+        subst(&s.ty, &map)
+    }
+
+    /// `code` (taking `n` arguments, of instantiated type `full`) applied to lowered `ops`:
+    /// fewer make a function value, exactly `n` call it, more call it and apply the rest to
+    /// the result. `ty` is the type of the whole application.
+    fn apply_code(&mut self, code: FnCode, n: usize, mut ops: Vec<Operand>, full: &Type, ty: Type) -> Operand {
+        if ops.len() < n {
+            let alloc = if ops.is_empty() { Alloc::Static } else { Alloc::Heap };
+            return self.eval_to_temp(ty, Rvalue::Aggregate(Agg::Fn { code, alloc }, ops));
+        }
+        let rest = ops.split_off(n);
+        let rty = if rest.is_empty() { ty.clone() } else { full.uncurry_n(n).1 };
+        let v = match code {
+            FnCode::Global(c) => self.eval_to_temp(rty, Rvalue::Call(c, ops)),
+            FnCode::Variant(t, i) => self.eval_to_temp(rty, Rvalue::Aggregate(Agg::Variant(t, i), ops)),
+            FnCode::Closure { .. } => unreachable!("closures are applied as values"),
+        };
+        if rest.is_empty() {
+            return v;
+        }
+        let mut vops = vec![v];
+        vops.extend(rest);
+        self.eval_to_temp(ty, Rvalue::Call(Callee::Value, vops))
+    }
+
+    /// A closure literal: lowers its body as a separate `Body` and builds its environment here.
+    fn closure(&mut self, e: &Expr, params: &[ClosureParam], body: &Block) -> Result<Operand, Diagnostic> {
+        let ci = self.info.closures[&e.id].clone();
+        self.lower_closure_body(&ci, params, body)?;
+        let mut env = Vec::new();
+        for (c, fty) in ci.captures.iter().zip(ci.env_fields()) {
+            let place = self.var_place(&c.name).expect("checked: captured variable is in scope");
+            let op = match c.mode {
+                CaptureMode::Shared => self.eval_to_temp(fty, Rvalue::Ref(false, place)),
+                CaptureMode::Mut => self.eval_to_temp(fty, Rvalue::Ref(true, place)),
+                CaptureMode::Reborrow => self.eval_to_temp(fty, Rvalue::Ref(true, place.deref())),
+                CaptureMode::Move => Operand::Place(place),
+            };
+            env.push(op);
+        }
+        let alloc = match (env.is_empty(), ci.is_move) {
+            (true, _) => Alloc::Static,
+            (false, true) => Alloc::Heap,
+            (false, false) => Alloc::Stack,
+        };
+        let targs = self.info.globals[&ci.name].scheme.vars.iter().map(|v| Type::Param(v.clone())).collect();
+        let fn_ty = Type::func(&ci.params, ci.ret.clone());
+        let f = self.eval_to_temp(fn_ty.clone(), Rvalue::Aggregate(Agg::Fn { code: FnCode::Closure { name: ci.name.clone(), targs }, alloc }, env));
+        if alloc == Alloc::Stack {
+            let Operand::Place(p) = f else { unreachable!() };
+            return Ok(self.eval_to_temp(Type::r#ref(false, fn_ty), Rvalue::Ref(false, p)));
+        }
+        Ok(f)
+    }
+
+    fn lower_closure_body(&mut self, ci: &ClosureInfo, params: &[ClosureParam], body: &Block) -> Result<(), Diagnostic> {
+        let mut l = Lowerer {
+            body: Body {
+                name: ci.name.clone(),
+                locals: vec![Local { name: "_ret".into(), ty: ci.ret.clone() }],
+                n_params: 1 + ci.params.len(),
+                blocks: vec![BasicBlock { stmts: vec![], term: Terminator::Unreachable }],
+                captures: ci.captures.iter().map(|c| c.name.clone()).collect(),
+            },
+            cur: 0,
+            scopes: vec![HashMap::new()],
+            info: self.info,
+            span: ci.span,
+            copy_params: self.copy_params.clone(),
+            or_sel: HashMap::new(),
+            owned: vec![vec![]],
+            loops: vec![],
+            captured: HashMap::new(),
+            extra: vec![],
+        };
+        let env = l.new_local("env", ci.env_type());
+        for (k, c) in ci.captures.iter().enumerate() {
+            let place = Place::local(env).deref().field(k);
+            let place = if c.mode == CaptureMode::Move { place } else { place.deref() };
+            l.captured.insert(c.name.clone(), place);
+        }
+        if params.is_empty() {
+            l.new_local("_unit", Type::unit());
+        }
+        for (p, t) in params.iter().zip(&ci.params) {
+            let id = l.new_local(&p.name, t.clone());
+            l.scopes[0].insert(p.name.clone(), id);
+        }
+        let v = l.block(body)?;
+        l.assign(0, Rvalue::Use(v));
+        l.terminate(Terminator::Return);
+        self.extra.push(l.body);
+        self.extra.extend(l.extra);
+        Ok(())
+    }
+
     fn callee_for_global(&self, e: &Expr, name: &str) -> Callee {
         let g = &self.info.globals[name];
         match g.kind {
@@ -778,12 +924,19 @@ impl<'a> Lowerer<'a> {
             }
             ExprKind::Bool(b) => Operand::Const(Const::Bool(*b)),
             ExprKind::Unit => Operand::Const(Const::Unit),
-            ExprKind::Var(n) => match self.lookup(n) {
-                Some(id) => Operand::local(id),
+            ExprKind::Var(n) => match self.var_place(n) {
+                Some(p) => Operand::Place(p),
                 None => {
                     let g = &self.info.globals[n];
                     if g.n_params != 0 {
-                        return Err(Diagnostic::new(e.span, "functions as values are not supported in this version"));
+                        // A named function or constructor as a value.
+                        let ty = self.ty(e);
+                        let n_params = g.n_params;
+                        let code = match g.kind {
+                            GlobalKind::Variant { index, .. } => FnCode::Variant(ty.uncurry_n(n_params).1, index),
+                            _ => FnCode::Global(self.callee_for_global(e, n)),
+                        };
+                        return Ok(self.apply_code(code, n_params, vec![], &ty.clone(), ty));
                     }
                     let ty = self.ty(e);
                     if let GlobalKind::Variant { index, .. } = g.kind {
@@ -820,19 +973,30 @@ impl<'a> Lowerer<'a> {
             }
             ExprKind::Dot { recv, args, .. } => {
                 let res = self.info.dots[&e.id].clone();
-                if let DotRes::Assoc { global, targs } = res {
+                // `Type.function(..)` and `Type.method(..)`: the receiver is a type, not evaluated.
+                let named = match &res {
+                    DotRes::Assoc { global, targs } | DotRes::MethodValue(MethodRes::Direct { global, targs }) => {
+                        let full = self.instantiated(global, targs);
+                        Some((Callee::Def { name: global.clone(), targs: targs.clone() }, self.info.globals[global].n_params, full))
+                    }
+                    DotRes::MethodValue(MethodRes::Trait { trait_name, method, self_ty }) => {
+                        let n = self.info.traits[trait_name].methods[method].n_params;
+                        let callee = Callee::Trait { trait_name: trait_name.clone(), method: method.clone(), self_ty: self_ty.clone() };
+                        Some((callee, n, self.ty(e)))
+                    }
+                    _ => None,
+                };
+                if let Some((callee, n, full)) = named {
+                    let args = args.as_deref().unwrap_or(&[]);
+                    if args.len() > n && matches!(callee, Callee::Trait { .. }) {
+                        return Err(Diagnostic::new(e.span, "too many arguments"));
+                    }
                     let mut ops = Vec::new();
-                    for a in args.as_deref().unwrap_or(&[]) {
+                    for a in args {
                         ops.push(self.arg(a)?);
                     }
-                    if ops.len() != self.info.globals[&global].n_params {
-                        return Err(Diagnostic::new(e.span, "partial application is not supported in this version"));
-                    }
                     let ty = self.ty(e);
-                    return Ok(self.eval_to_temp(ty, Rvalue::Call(Callee::Def { name: global, targs }, ops)));
-                }
-                if matches!(res, DotRes::MethodValue(_)) {
-                    return Err(Diagnostic::new(e.span, "functions as values are not supported in this version"));
+                    return Ok(self.apply_code(FnCode::Global(callee), n, ops, &full, ty));
                 }
                 let rv = self.expr(recv)?;
                 // Two-phase: a `&mut self` auto-borrow is taken after the arguments are evaluated.
@@ -845,17 +1009,19 @@ impl<'a> Lowerer<'a> {
                         Operand::Place(place.field(i))
                     }
                     DotRes::Method(m) => {
-                        let (callee, n_params) = match m {
-                            MethodRes::Direct { global, targs } => (Callee::Def { name: global.clone(), targs }, self.info.globals[&global].n_params),
+                        let (callee, n_params, full) = match m {
+                            MethodRes::Direct { global, targs } => {
+                                let full = self.instantiated(&global, &targs);
+                                (Callee::Def { name: global.clone(), targs }, self.info.globals[&global].n_params, Some(full))
+                            }
                             MethodRes::Trait { trait_name, method, self_ty } => {
                                 let n = self.info.traits[&trait_name].methods[&method].n_params;
-                                (Callee::Trait { trait_name, method, self_ty }, n)
+                                (Callee::Trait { trait_name, method, self_ty }, n, None)
                             }
                         };
                         let args = args.as_deref().unwrap_or(&[]);
-                        if args.len() + 1 != n_params {
-                            let msg = if args.len() + 1 < n_params { "partial application is not supported in this version" } else { "too many arguments" };
-                            return Err(Diagnostic::new(e.span, msg));
+                        if args.len() + 1 > n_params && full.is_none() {
+                            return Err(Diagnostic::new(e.span, "too many arguments"));
                         }
                         let mut ops = vec![Operand::Const(Const::Unit)];
                         for a in args {
@@ -868,7 +1034,8 @@ impl<'a> Lowerer<'a> {
                             self.reborrow(rv, &rty)
                         };
                         let ty = self.ty(e);
-                        self.eval_to_temp(ty, Rvalue::Call(callee, ops))
+                        let full = full.unwrap_or_else(|| ty.clone());
+                        self.apply_code(FnCode::Global(callee), n_params, ops, &full, ty)
                     }
                     DotRes::Assoc { .. } | DotRes::MethodValue(_) => unreachable!(),
                 }
@@ -951,26 +1118,41 @@ impl<'a> Lowerer<'a> {
                 self.eval_to_temp(ty, Rvalue::Binary(*op, va, vb))
             }
             ExprKind::Call(f, args) => {
-                let name = match &f.kind {
-                    ExprKind::Var(n) if self.lookup(n).is_none() => n.clone(),
-                    _ => return Err(Diagnostic::new(f.span, "only direct calls are supported in this version")),
+                let ty = self.ty(e);
+                let global = match &f.kind {
+                    ExprKind::Var(n) if self.var_place(n).is_none() => Some(n.clone()),
+                    _ => None,
+                };
+                let Some(name) = global else {
+                    // A function value (or a reference to one).
+                    let mut ops = vec![self.expr(f)?];
+                    for a in args {
+                        ops.push(self.arg(a)?);
+                    }
+                    if args.is_empty() {
+                        ops.push(Operand::Const(Const::Unit));
+                    }
+                    return Ok(self.eval_to_temp(ty, Rvalue::Call(Callee::Value, ops)));
                 };
                 let g = &self.info.globals[&name];
-                if args.len() != g.n_params {
-                    return Err(Diagnostic::new(e.span, "partial application is not supported in this version"));
-                }
-                let is_variant = matches!(g.kind, GlobalKind::Variant { .. });
+                let n_params = g.n_params;
+                let variant = match g.kind {
+                    GlobalKind::Variant { index, .. } => Some(index),
+                    _ => None,
+                };
                 let mut ops = Vec::new();
                 for a in args {
-                    ops.push(if is_variant { self.expr(a)? } else { self.arg(a)? });
+                    ops.push(if variant.is_some() { self.expr(a)? } else { self.arg(a)? });
                 }
-                let g = &self.info.globals[&name];
-                let ty = self.ty(e);
-                if let GlobalKind::Variant { index, .. } = g.kind {
-                    return Ok(self.eval_to_temp(ty.clone(), Rvalue::Aggregate(Agg::Variant(ty, index), ops)));
+                let full = self.ty(f);
+                if args.is_empty() && n_params > 0 {
+                    ops.push(Operand::Const(Const::Unit));
                 }
-                let callee = self.callee_for_global(f, &name);
-                self.eval_to_temp(ty, Rvalue::Call(callee, ops))
+                let code = match variant {
+                    Some(index) => FnCode::Variant(full.uncurry_n(n_params).1, index),
+                    None => FnCode::Global(self.callee_for_global(f, &name)),
+                };
+                self.apply_code(code, n_params, ops, &full, ty)
             }
             ExprKind::If { cond, then, els } => {
                 let c = self.expr(cond)?;
@@ -1096,7 +1278,7 @@ impl<'a> Lowerer<'a> {
                 self.cur = self.new_block();
                 Operand::Const(Const::Unit)
             }
-            ExprKind::Closure { .. } => return Err(Diagnostic::new(e.span, "closures are not supported in this version")),
+            ExprKind::Closure { params, body, .. } => self.closure(e, params, body)?,
             ExprKind::Next => {
                 let ctx = self.loops.last().cloned().expect("checked: next inside a loop");
                 self.exit_scopes(ctx.depth);
@@ -1120,7 +1302,7 @@ impl<'a> Lowerer<'a> {
     /// Place denoted by an assignment target (checked by the type checker).
     fn place_of(&mut self, lhs: &Expr) -> Result<Place, Diagnostic> {
         match &lhs.kind {
-            ExprKind::Var(n) => Ok(Place::local(self.lookup(n).expect("checked local"))),
+            ExprKind::Var(n) => Ok(self.var_place(n).expect("checked local")),
             ExprKind::Dot { recv, .. } => {
                 let DotRes::Field(i) = self.info.dots[&lhs.id] else { unreachable!("checker allows only fields") };
                 let mut p = self.place_of(recv)?;
@@ -1326,11 +1508,23 @@ pub fn dump(b: &Body) -> String {
                             Callee::Def { name, targs } => format!("call {name}{}({})", fmt_targs(targs), args(ops)),
                             Callee::Extern(n) => format!("call extern {n}({})", args(ops)),
                             Callee::Trait { trait_name, method, self_ty } => format!("call {trait_name}::{method}[{self_ty}]({})", args(ops)),
+                            Callee::Value => format!("call value {}({})", fmt_operand(&ops[0]), args(&ops[1..])),
                         },
                         Rvalue::Aggregate(agg, ops) => match agg {
                             Agg::Struct(t) => format!("{t} {{ {} }}", args(ops)),
                             Agg::Tuple(_) => format!("({})", args(ops)),
                             Agg::Variant(t, i) => format!("{t}::{i}({})", args(ops)),
+                            Agg::Fn { code, alloc } => {
+                                let code = match code {
+                                    FnCode::Closure { name, targs } => format!("closure {name}{}", fmt_targs(targs)),
+                                    FnCode::Global(Callee::Def { name, targs }) => format!("global {name}{}", fmt_targs(targs)),
+                                    FnCode::Global(Callee::Extern(n)) => format!("global extern {n}"),
+                                    FnCode::Global(Callee::Trait { trait_name, method, self_ty }) => format!("global {trait_name}::{method}[{self_ty}]"),
+                                    FnCode::Global(Callee::Value) => unreachable!("values are applied, not wrapped"),
+                                    FnCode::Variant(t, i) => format!("variant {t}::{i}"),
+                                };
+                                format!("make_fn {code} [{}] {}", args(ops), format!("{alloc:?}").to_lowercase())
+                            }
                         },
                         Rvalue::Discriminant(p) => format!("discr({})", fmt_place(p)),
                     };
@@ -1412,12 +1606,6 @@ mod tests {
              bb0:\n  _0 = _1\n  return\n\
              bb1:\n  _0 = 0\n  return\n"
         );
-    }
-
-    #[test]
-    fn partial_application_rejected_for_now() {
-        let err = lower_src("def add(a: Int, b: Int) -> Int\n  a + b\nend\ndef main\n  add(1)\n  ()\nend\n").unwrap_err();
-        assert_eq!(err.msg, "partial application is not supported in this version");
     }
 
     #[test]
@@ -1574,5 +1762,58 @@ end
         assert!(g.contains("bb3:
   _12 = Eq _2 _3
 "), "{g}");
+    }
+
+    /// Dumps of every body whose name starts with `prefix`, joined.
+    fn dumps(src: &str, prefix: &str) -> String {
+        lower_src(src).unwrap().iter().filter(|b| b.name.starts_with(prefix)).map(dump).collect::<Vec<_>>().join("\n")
+    }
+
+    #[test]
+    fn borrowing_closure_is_a_stack_value_behind_a_reference() {
+        let d = dumps("def main\n  let mut total = 0\n  let f = { |i: Int| total += i }\n  f(1)\n  ()\nend\n", "main");
+        assert!(d.contains("  _2 = &mut _1\n  _3 = make_fn closure main#c0 [_2] stack\n  _4 = &_3\n"), "{d}");
+        assert!(d.contains("call value _5(1)"), "{d}");
+        assert!(d.contains("fn main#c0(_1: &(&mut Int), _2: Int) -> Unit\nbb0:\n  _3 = Add (*(*_1).0) _2\n  (*(*_1).0) = _3\n"), "{d}");
+    }
+
+    #[test]
+    fn move_closure_moves_its_capture_into_a_heap_environment() {
+        let d = dumps("def mk(s: String) -> Unit -> String\n  move { || s.clone }\nend\ndef main\n  ()\nend\n", "mk");
+        assert!(d.contains("  _2 = make_fn closure mk#c0 [_1] heap\n  _0 = _2\n"), "{d}");
+        assert!(d.contains("fn mk#c0(_1: &(String), _2: Unit) -> String\nbb0:\n  _3 = &(*_1).0\n"), "{d}");
+    }
+
+    #[test]
+    fn function_values_partial_and_over_application() {
+        let d = dumps("def add(a: Int, b: Int) -> Int\n  a + b\nend\ndef adder(k: Int) -> Int -> Int\n  move { |x| x + k }\nend\n\
+                       def main\n  let g = add(1)\n  let h = add\n  let w = Some\n  let o = w(1)\n  let r = adder(1)(2)\n  let q = adder(1, 2)\n  let v = g(3)\n  ()\nend\n", "main");
+        for want in [
+            "_1 = make_fn global add [1] heap",
+            "_3 = make_fn global add [] static",
+            "_5 = make_fn variant Option[Int]::0 [] static",
+            "_7 = call value _6(1)",
+            "_9 = call adder(1)\n  _10 = call value _9(2)",
+            "_12 = call adder(1)\n  _13 = call value _12(2)",
+            "_15 = call value _2(3)",
+        ] {
+            assert!(d.contains(want), "missing {want:?} in\n{d}");
+        }
+    }
+
+    #[test]
+    fn methods_as_values_and_partially_applied_method_calls() {
+        let src = "struct P\n  x: Int\nend\nimpl P\n  def plus(&self, k: Int) -> Int\n    @x + k\n  end\nend\n\
+                   def main\n  let p = P { x: 1 }\n  let m = P.plus\n  let a = m(&p, 2)\n  let s = p.plus\n  let b = s(3)\n  ()\nend\n";
+        let d = dumps(src, "main");
+        assert!(d.contains("make_fn global P#") && d.contains("::plus [] static"), "{d}");
+        assert!(d.contains("::plus [_") && d.contains("] heap"), "{d}");
+        assert!(d.contains("call value"), "{d}");
+    }
+
+    #[test]
+    fn nested_closure_builds_its_environment_from_the_outer_one() {
+        let d = dumps("def main\n  let mut n = 0\n  let f = { |y: Int|\n    let g = { |x: Int| n += x }\n    g(y)\n  }\n  ()\nend\n", "main#c1");
+        assert!(d.contains("  _3 = &mut (*(*_1).0)\n  _4 = make_fn closure main#c0 [_3] stack\n  _5 = &_4\n"), "{d}");
     }
 }

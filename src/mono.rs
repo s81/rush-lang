@@ -95,6 +95,7 @@ impl<'a> Mono<'a> {
     fn callee(&mut self, c: &Callee, map: &HashMap<String, Type>) -> Result<Callee, Diagnostic> {
         Ok(match c {
             Callee::Extern(n) => Callee::Extern(n.clone()),
+            Callee::Value => Callee::Value,
             Callee::Def { name, targs } => {
                 let targs: Vec<Type> = targs.iter().map(|t| subst(t, map)).collect();
                 if is_intrinsic(name) {
@@ -121,6 +122,7 @@ impl<'a> Mono<'a> {
             locals: body.locals.iter().map(|l| Local { name: l.name.clone(), ty: subst(&l.ty, &map) }).collect(),
             n_params: body.n_params,
             blocks: Vec::new(),
+            captures: body.captures.clone(),
         };
         for bb in &body.blocks {
             let mut stmts = Vec::new();
@@ -130,6 +132,9 @@ impl<'a> Mono<'a> {
                     Statement::StorageDead(l, sp) => Statement::StorageDead(*l, *sp),
                     Statement::Assign(place, rv, sp) => {
                         let rv = match rv {
+                            Rvalue::Call(Callee::Value, _) | Rvalue::Aggregate(Agg::Fn { .. }, _) => {
+                                return Err(Diagnostic::new(*sp, "function values are not supported in this version"));
+                            }
                             Rvalue::Call(c, ops) => {
                                 let c = self.callee(c, &map)?;
                                 if let Callee::Def { name, targs } = &c {
@@ -144,6 +149,7 @@ impl<'a> Mono<'a> {
                                     Agg::Struct(t) => Agg::Struct(subst(t, &map)),
                                     Agg::Tuple(t) => Agg::Tuple(subst(t, &map)),
                                     Agg::Variant(t, i) => Agg::Variant(subst(t, &map), *i),
+                                    Agg::Fn { .. } => unreachable!("rejected above"),
                                 };
                                 Rvalue::Aggregate(agg, ops.clone())
                             }
