@@ -33,7 +33,7 @@ fn contained_adts(t: &Type, adts: &HashMap<String, usize>, out: &mut Vec<String>
 }
 
 /// Rejects references where Plan 3a cannot track them (fields and return types).
-fn no_refs(t: &Type, span: Span) -> Result<(), Diagnostic> {
+pub(super) fn no_refs(t: &Type, span: Span) -> Result<(), Diagnostic> {
     match t {
         Type::Con(n, _) if n == "&" || n == "&mut" => Err(Diagnostic::new(span, "references in this position are not supported until Plan 3b")),
         Type::Con(_, args) => args.iter().try_for_each(|a| no_refs(a, span)),

@@ -498,6 +498,15 @@ impl<'a> Checker<'a> {
         };
         self.inf.unify(&ret, &body_ty, last_span(&job.def.body, job.def.span))?;
         self.solve_pending()?;
+        // Inferred signatures get the same Plan 3a limits as annotated ones: no reference may
+        // leave the function through its result or be written behind a `&mut` parameter.
+        let span = job.def.ret.as_ref().map(|t| t.span()).unwrap_or(job.def.span);
+        super::decls::no_refs(&self.inf.resolve(&ret), span)?;
+        for p in g.scheme.ty.uncurry_n(g.n_params).0 {
+            if let Some((true, inner)) = self.inf.resolve(&p).as_ref() {
+                super::decls::no_refs(inner, span)?;
+            }
+        }
         if !job.generalize {
             // Declared generics: every remaining variable must have been fixed by the body.
             let ty = self.inf.resolve(&g.scheme.ty);
@@ -1734,6 +1743,10 @@ mod tests {
     fn references_rejected_in_fields_and_returns() {
         assert_eq!(err("struct S\n  r: &Int\nend\ndef main\n  ()\nend\n"), "references in this position are not supported until Plan 3b");
         assert_eq!(err("def f(x: &Int) -> &Int\n  x\nend\ndef main\n  ()\nend\n"), "references in this position are not supported until Plan 3b");
+        let msg = "references in this position are not supported until Plan 3b";
+        assert_eq!(err("def f\n  let s = int_to_s(1)\n  &s\nend\ndef main\n  ()\nend\n"), msg);
+        assert_eq!(err("def f\n  let s = int_to_s(1)\n  Some(&s)\nend\ndef main\n  ()\nend\n"), msg);
+        assert_eq!(err("def f(o: &mut Option[&String])\n  ()\nend\ndef main\n  ()\nend\n"), msg);
     }
 
     #[test]
