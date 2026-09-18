@@ -103,18 +103,26 @@ impl<'a> Gen<'a> {
         (by_value, by_ptr)
     }
 
-    fn collect_type(&self, t: &Type, order: &mut Vec<Type>, visiting: &mut HashSet<Type>) {
+    /// Orders `t` after every type it contains by value. Types reached through pointers go to
+    /// `pending` and are walked only after this by-value walk finishes, so a half-visited type
+    /// is never emitted after a type that contains it.
+    fn collect_type(&self, t: &Type, order: &mut Vec<Type>, visiting: &mut HashSet<Type>, pending: &mut Vec<Type>) {
         let t = strip_pointers(t);
         if !self.is_adt(&t) || order.contains(&t) || !visiting.insert(t.clone()) {
             return;
         }
         let (by_value, by_ptr) = self.deps(&t);
         for d in by_value {
-            self.collect_type(&d, order, visiting);
+            self.collect_type(&d, order, visiting, pending);
         }
         order.push(t.clone());
-        for d in by_ptr {
-            self.collect_type(&d, order, visiting);
+        pending.extend(by_ptr);
+    }
+
+    fn collect_root(&self, t: &Type, order: &mut Vec<Type>, visiting: &mut HashSet<Type>) {
+        let mut pending = vec![t.clone()];
+        while let Some(t) = pending.pop() {
+            self.collect_type(&t, order, visiting, &mut pending);
         }
     }
 
@@ -123,7 +131,7 @@ impl<'a> Gen<'a> {
         let mut visiting = HashSet::new();
         for b in bodies {
             for l in &b.locals {
-                self.collect_type(&l.ty, &mut order, &mut visiting);
+                self.collect_root(&l.ty, &mut order, &mut visiting);
             }
             for bb in &b.blocks {
                 for s in &bb.stmts {
@@ -133,10 +141,10 @@ impl<'a> Gen<'a> {
                                 let t = match agg {
                                     Agg::Struct(t) | Agg::Tuple(t) | Agg::Variant(t, _) => t,
                                 };
-                                self.collect_type(t, &mut order, &mut visiting);
+                                self.collect_root(t, &mut order, &mut visiting);
                             }
                             Rvalue::Call(Callee::Def { name, targs }, _) if name == "Gc::new" => {
-                                self.collect_type(&targs[0], &mut order, &mut visiting);
+                                self.collect_root(&targs[0], &mut order, &mut visiting);
                             }
                             _ => {}
                         }
@@ -544,6 +552,15 @@ mod tests {
         let s = c.find("struct rush_S {").unwrap();
         assert!(p < s && t < s, "{c}");
         assert!(c.contains("  int32_t tag;\n  union {\n    struct { rush_P f0; } v0;\n    struct { rush_P f0; rush_Tuple_L_Int__Bool_R f1; } v1;\n  } u;\n"), "{c}");
+    }
+
+    #[test]
+    fn types_behind_pointers_do_not_jump_ahead_of_their_containers() {
+        let src = "struct List\n  head: Option[Gc[Cell]]\nend\nstruct Cell\n  value: Int\n  rest: List\nend\ndef mk() -> List\n  List { head: None }\nend\ndef main\n  let l = mk()\n  let c = Gc.new(Cell { value: 1, rest: mk() })\n  ()\nend\n";
+        let c = gen_src(src);
+        let list = c.find("struct rush_List {").unwrap();
+        let cell = c.find("struct rush_Cell {").unwrap();
+        assert!(list < cell, "{c}");
     }
 
     #[test]
