@@ -35,8 +35,36 @@ def unwrap_or[T](o: Option[T], default: T) -> T
 end
 
 def main
-  puts(Rect(2.0, 3.0).describe)
+  puts(&Rect(2.0, 3.0).describe)
   puts("#{unwrap_or(Some(3), 0)} #{Some("x")}")
+end
+```
+
+Values are owned and moved; borrows are explicit for named variables and automatic for
+method receivers and temporaries; heap data is freed by compiler-inserted drops; `Gc[T]`
+opts a value into the collector.
+
+```ruby
+struct Person
+  derive Show, Eq, Clone
+  name: String
+  age: Int
+end
+
+impl Person
+  def birthday(&mut self)
+    @age += 1
+  end
+end
+
+def main
+  let mut p = Person { name: "Ann", age: 30 }
+  p.birthday
+  let q = p.clone
+  let r = p                 # p is moved; using it again is a compile error
+  puts("#{q == r} #{q}")    # true Person { name: "Ann", age: 31 }
+  let shared = Gc.new(q)
+  puts("#{shared.borrow.age}")
 end
 ```
 
