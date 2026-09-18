@@ -633,7 +633,7 @@ impl Parser {
     fn expr(&mut self) -> Result<Expr, Diagnostic> {
         if self.is_kw("return") {
             let sp = self.bump().span;
-            let val = if matches!(self.peek(), Tok::Newline | Tok::Eof) || self.is_kw("end") {
+            let val = if matches!(self.peek(), Tok::Newline | Tok::Eof | Tok::Op("}")) || self.is_kw("end") {
                 None
             } else {
                 Some(Box::new(self.expr()?))
@@ -988,7 +988,7 @@ impl Parser {
             }
             Tok::Kw("break") => {
                 self.bump();
-                if matches!(self.peek(), Tok::Newline | Tok::Eof) || self.is_kw("end") {
+                if matches!(self.peek(), Tok::Newline | Tok::Eof | Tok::Op("}")) || self.is_kw("end") {
                     return Ok(self.mk(ExprKind::Break(None), sp));
                 }
                 let v = self.expr()?;

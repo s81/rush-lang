@@ -831,6 +831,9 @@ impl<'a> Lowerer<'a> {
                     let ty = self.ty(e);
                     return Ok(self.eval_to_temp(ty, Rvalue::Call(Callee::Def { name: global, targs }, ops)));
                 }
+                if matches!(res, DotRes::MethodValue(_)) {
+                    return Err(Diagnostic::new(e.span, "functions as values are not supported in this version"));
+                }
                 let rv = self.expr(recv)?;
                 // Two-phase: a `&mut self` auto-borrow is taken after the arguments are evaluated.
                 let two_phase = matches!(res, DotRes::Method(_)) && self.info.adjust.get(&recv.id) == Some(&Adjust::AutoRef(true));
@@ -867,7 +870,7 @@ impl<'a> Lowerer<'a> {
                         let ty = self.ty(e);
                         self.eval_to_temp(ty, Rvalue::Call(callee, ops))
                     }
-                    DotRes::Assoc { .. } => unreachable!(),
+                    DotRes::Assoc { .. } | DotRes::MethodValue(_) => unreachable!(),
                 }
             }
             ExprKind::TupleIndex(recv, i) => {
@@ -1093,7 +1096,7 @@ impl<'a> Lowerer<'a> {
                 self.cur = self.new_block();
                 Operand::Const(Const::Unit)
             }
-            ExprKind::Closure { .. } => unreachable!("rejected by the type checker until Plan 4a Task 4"),
+            ExprKind::Closure { .. } => return Err(Diagnostic::new(e.span, "closures are not supported in this version")),
             ExprKind::Next => {
                 let ctx = self.loops.last().cloned().expect("checked: next inside a loop");
                 self.exit_scopes(ctx.depth);
