@@ -56,20 +56,6 @@ struct Ck<'a> {
     move_spans: HashMap<LocalId, Span>,
 }
 
-fn describe_place(body: &Body, p: &Place) -> String {
-    let mut s = body.locals[p.local as usize].name.clone();
-    if s.is_empty() {
-        s = "value".into();
-    }
-    for pr in &p.proj {
-        match pr {
-            Proj::Field(i) | Proj::Downcast(_, i) => s = format!("{s}.{i}"),
-            Proj::Deref => s = format!("*{s}"),
-        }
-    }
-    s
-}
-
 impl<'a> Ck<'a> {
     fn is_copy(&self, t: &Type) -> bool {
         let cps = &self.copy_params;
@@ -123,7 +109,7 @@ impl<'a> Ck<'a> {
         if p.proj.contains(&Proj::Deref) {
             return Err(Diagnostic::new(span, "cannot move out of a reference; use `.clone`"));
         }
-        Err(Diagnostic::new(span, format!("cannot move out of `{}`; use `.clone`", describe_place(self.body, p))))
+        Err(Diagnostic::new(span, format!("cannot move out of `{}`; use `.clone`", describe_place(self.info, self.body, p))))
     }
 
     fn read_operand(&self, st: &State, op: &Operand, span: Span) -> Result<(), Diagnostic> {
@@ -136,7 +122,7 @@ impl<'a> Ck<'a> {
     /// Applies a statement to the state, reporting errors.
     fn step(&mut self, st: &mut State, s: &Statement) -> Result<(), Diagnostic> {
         match s {
-            Statement::Drop(..) => Ok(()),
+            Statement::Drop(..) | Statement::StorageDead(..) => Ok(()),
             Statement::Assign(target, rv, span) => {
                 match rv {
                     Rvalue::Use(op) => self.use_operand(st, op, *span)?,
@@ -182,36 +168,6 @@ fn successors(t: &Terminator) -> Vec<BlockId> {
         Terminator::Goto(b) => vec![*b],
         Terminator::If(_, a, b) => vec![*a, *b],
         Terminator::Return | Terminator::Unreachable => vec![],
-    }
-}
-
-/// Emits a chain of blocks that replaces one original block.
-struct Emit {
-    chunks: Vec<(BlockId, Vec<Statement>, Terminator)>,
-    cur_id: BlockId,
-    cur: Vec<Statement>,
-    next: BlockId,
-}
-
-impl Emit {
-    fn alloc(&mut self) -> BlockId {
-        let id = self.next;
-        self.next += 1;
-        id
-    }
-    /// `if flag then drop(place)`; continues in a fresh block.
-    fn guarded_drop(&mut self, flag: LocalId, place: Place, span: Span) {
-        let drop_bb = self.alloc();
-        let cont_bb = self.alloc();
-        let stmts = std::mem::take(&mut self.cur);
-        self.chunks.push((self.cur_id, stmts, Terminator::If(Operand::local(flag), drop_bb, cont_bb)));
-        self.chunks.push((drop_bb, vec![Statement::Drop(place, span)], Terminator::Goto(cont_bb)));
-        self.cur_id = cont_bb;
-    }
-    fn finish(mut self, term: Terminator) -> Vec<(BlockId, Vec<Statement>, Terminator)> {
-        let stmts = std::mem::take(&mut self.cur);
-        self.chunks.push((self.cur_id, stmts, term));
-        self.chunks
     }
 }
 
@@ -278,7 +234,7 @@ fn check_body(body: &mut Body, info: &TypeInfo) -> Result<(), Diagnostic> {
         };
         let mut em = Emit { chunks: vec![], cur_id: bi as BlockId, cur: vec![], next };
         let entry_span = bb.stmts.first().map(|s| match s {
-            Statement::Assign(_, _, sp) | Statement::Drop(_, sp) => *sp,
+            Statement::Assign(_, _, sp) | Statement::Drop(_, sp) | Statement::StorageDead(_, sp) => *sp,
         }).unwrap_or_default();
         if bi == 0 {
             for &l in &tracked {
@@ -305,7 +261,7 @@ fn check_body(body: &mut Body, info: &TypeInfo) -> Result<(), Diagnostic> {
                     let old_live = whole_tracked && (st.live[target.local as usize] || st.partial[target.local as usize]);
                     ck.step(&mut st, s)?;
                     if old_live {
-                        em.guarded_drop(flag_of[&target.local], Place::local(target.local), *span);
+                        em.guarded(flag_of[&target.local], vec![Statement::Drop(Place::local(target.local), *span)]);
                     }
                     em.cur.push(s.clone());
                     for m in moved {
@@ -315,7 +271,7 @@ fn check_body(body: &mut Body, info: &TypeInfo) -> Result<(), Diagnostic> {
                         em.cur.push(set_flag(target.local, true, *span));
                     }
                 }
-                Statement::Drop(..) => {
+                Statement::Drop(..) | Statement::StorageDead(..) => {
                     ck.step(&mut st, s)?;
                     em.cur.push(s.clone());
                 }
@@ -323,7 +279,7 @@ fn check_body(body: &mut Body, info: &TypeInfo) -> Result<(), Diagnostic> {
         }
         if matches!(bb.term, Terminator::Return) {
             for &l in &tracked {
-                em.guarded_drop(flag_of[&l], Place::local(l), entry_span);
+                em.guarded(flag_of[&l], vec![Statement::Drop(Place::local(l), entry_span)]);
             }
         }
         next = em.next;
@@ -401,7 +357,7 @@ mod tests {
 
     #[test]
     fn move_out_of_field_and_reference() {
-        assert_eq!(err("struct P\n  name: String\nend\ndef main\n  let p = P { name: \"a\" }\n  let n = p.name\n  ()\nend\n"), "cannot move out of `p.0`; use `.clone`");
+        assert_eq!(err("struct P\n  name: String\nend\ndef main\n  let p = P { name: \"a\" }\n  let n = p.name\n  ()\nend\n"), "cannot move out of `p.name`; use `.clone`");
         assert_eq!(err("def f(p: &String) -> String\n  *p\nend\ndef main\n  ()\nend\n"), "cannot move out of a reference; use `.clone`");
     }
 

@@ -127,6 +127,7 @@ impl<'a> Mono<'a> {
             for s in &bb.stmts {
                 let s = match s {
                     Statement::Drop(p, sp) => Statement::Drop(p.clone(), *sp),
+                    Statement::StorageDead(l, sp) => Statement::StorageDead(*l, *sp),
                     Statement::Assign(place, rv, sp) => {
                         let rv = match rv {
                             Rvalue::Call(c, ops) => Rvalue::Call(self.callee(c, &map)?, ops.clone()),

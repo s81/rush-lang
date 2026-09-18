@@ -400,6 +400,7 @@ impl<'a> Gen<'a> {
             writeln!(c, "bb{i}:").unwrap();
             for s in &bb.stmts {
                 match s {
+                    Statement::StorageDead(..) => {}
                     Statement::Drop(p, _) => {
                         let (expr, ty) = self.place(b, p);
                         if self.info.needs_drop(&ty) {
