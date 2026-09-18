@@ -200,6 +200,8 @@ struct Lowerer<'a> {
     info: &'a TypeInfo,
     span: Span,
     copy_params: Vec<String>,
+    /// Or-pattern -> local holding the index of the alternative that matched.
+    or_sel: HashMap<PatId, LocalId>,
 }
 
 fn lower_def(global: &str, d: &Def, info: &TypeInfo) -> Result<Body, Diagnostic> {
@@ -218,6 +220,7 @@ fn lower_def(global: &str, d: &Def, info: &TypeInfo) -> Result<Body, Diagnostic>
         info,
         span: d.span,
         copy_params,
+        or_sel: HashMap::new(),
     };
     let mut params = params.into_iter();
     if d.self_param.is_some() {
@@ -320,8 +323,12 @@ impl<'a> Lowerer<'a> {
                         self.assign(id, Rvalue::Use(v));
                         self.scopes.last_mut().unwrap().insert(name.clone(), id);
                     } else {
+                        // Irrefutable: the failure block stays unreachable.
                         let place = self.as_place(v, ty);
-                        self.bind_pat(pat, &place);
+                        let binds = self.declare_binders(pat);
+                        let fail = self.new_block();
+                        self.test_pat(pat, &place, fail);
+                        self.bind_case(pat, &place, &binds);
                         self.drop_uncovered(pat, &place);
                     }
                     last = Operand::Const(Const::Unit);
@@ -336,39 +343,71 @@ impl<'a> Lowerer<'a> {
         Ok(last)
     }
 
-    /// Binds the names of an irrefutable pattern to (projections of) `place`.
-    fn bind_pat(&mut self, pat: &Pattern, place: &Place) {
+    /// Allocates one local per bound name (shared by or-alternatives) in the current scope.
+    fn declare_binders(&mut self, pat: &Pattern) -> HashMap<String, LocalId> {
+        let mut names = Vec::new();
+        collect_binders(pat, &mut names);
+        let mut binds = HashMap::new();
+        for (name, pid) in names {
+            let ty = self.info.pat_types[&pid].clone();
+            let id = self.new_local(&name, ty);
+            binds.insert(name.clone(), id);
+            self.scopes.last_mut().unwrap().insert(name, id);
+        }
+        binds
+    }
+
+    /// Assigns the bindings of a pattern whose tests (`test_pat`) already passed. Runs after all
+    /// tests so that moving a binding out never precedes a read of the scrutinee.
+    fn bind_case(&mut self, pat: &Pattern, place: &Place, binds: &HashMap<String, LocalId>) {
         let place = if self.info.pat_deref.contains(&pat.id) { place.deref() } else { place.clone() };
         match &pat.kind {
             PatKind::Wild | PatKind::Lit(_) => {}
-            PatKind::Bind(name) => {
-                let id = self.bind_local(pat, name, &place);
-                self.scopes.last_mut().unwrap().insert(name.clone(), id);
-            }
+            PatKind::Bind(name) => self.assign_binding(binds[name], pat, &place),
             PatKind::At(name, inner) => {
-                let id = self.bind_local(pat, name, &place);
-                self.scopes.last_mut().unwrap().insert(name.clone(), id);
-                self.bind_pat(inner, &place);
+                self.assign_binding(binds[name], pat, &place);
+                self.bind_case(inner, &place, binds);
             }
             PatKind::Tuple(ps) => {
                 for (i, p) in ps.iter().enumerate() {
-                    self.bind_pat(p, &place.field(i));
+                    self.bind_case(p, &place.field(i), binds);
                 }
             }
             PatKind::Variant { name, fields } => {
                 let (_, idx) = self.info.variant_names[name];
                 for (i, p) in fields.iter().enumerate() {
-                    self.bind_pat(p, &place.downcast(idx, i));
+                    self.bind_case(p, &place.downcast(idx, i), binds);
                 }
             }
             PatKind::Struct { name, fields } => {
                 for (fname, p) in fields {
                     let sub = self.field_place(name, fname, &place);
-                    self.bind_pat(p, &sub);
+                    self.bind_case(p, &sub, binds);
                 }
             }
-            PatKind::Or(alts) => self.bind_pat(&alts[0], &place),
+            PatKind::Or(alts) => self.on_alt(pat, alts.len(), &mut |this, i| this.bind_case(&alts[i], &place, binds)),
         }
+    }
+
+    /// Runs `f` for the alternative of or-pattern `pat` that `test_pat` recorded as matching.
+    fn on_alt(&mut self, pat: &Pattern, n: usize, f: &mut dyn FnMut(&mut Self, usize)) {
+        let sel = self.or_sel[&pat.id];
+        let join = self.new_block();
+        for i in 0..n {
+            if i + 1 < n {
+                let ok = self.eval_to_temp(Type::con("Bool"), Rvalue::Binary(BinOp::Eq, Operand::local(sel), Operand::Const(Const::Int(i as i64))));
+                let (yes, no) = (self.new_block(), self.new_block());
+                self.terminate(Terminator::If(ok, yes, no));
+                self.cur = yes;
+                f(self, i);
+                self.terminate(Terminator::Goto(join));
+                self.cur = no;
+            } else {
+                f(self, i);
+                self.terminate(Terminator::Goto(join));
+            }
+        }
+        self.cur = join;
     }
 
     /// Creates the local for a binding and assigns it (by reference, move, or copy).
@@ -398,7 +437,7 @@ impl<'a> Lowerer<'a> {
             PatKind::At(_, inner) => self.info.pat_moves.contains(&pat.id) || self.pattern_moves(inner),
             PatKind::Tuple(ps) | PatKind::Variant { fields: ps, .. } => ps.iter().any(|q| self.pattern_moves(q)),
             PatKind::Struct { fields, .. } => fields.iter().any(|(_, q)| self.pattern_moves(q)),
-            PatKind::Or(alts) => self.pattern_moves(&alts[0]),
+            PatKind::Or(alts) => alts.iter().any(|a| self.pattern_moves(a)),
             PatKind::Wild | PatKind::Lit(_) => false,
         }
     }
@@ -456,7 +495,7 @@ impl<'a> Lowerer<'a> {
                     }
                 }
             }
-            PatKind::Or(alts) => self.drop_rest(&alts[0], place),
+            PatKind::Or(alts) => self.on_alt(pat, alts.len(), &mut |this, i| this.drop_rest(&alts[i], place)),
         }
     }
 
@@ -849,17 +888,9 @@ impl<'a> Lowerer<'a> {
             self.cur = next_test;
             next_test = self.new_block();
             self.scopes.push(HashMap::new());
-            // Allocate one local per bound name, shared by or-alternatives.
-            let mut names = Vec::new();
-            collect_binders(&arm.pat, &mut names);
-            let mut binds: HashMap<String, LocalId> = HashMap::new();
-            for (name, pid) in names {
-                let ty = self.info.pat_types[&pid].clone();
-                let id = self.new_local(&name, ty);
-                binds.insert(name.clone(), id);
-                self.scopes.last_mut().unwrap().insert(name, id);
-            }
-            self.test_pat(&arm.pat, &splace, next_test, &binds);
+            let binds = self.declare_binders(&arm.pat);
+            self.test_pat(&arm.pat, &splace, next_test);
+            self.bind_case(&arm.pat, &splace, &binds);
             if let Some(g) = &arm.guard {
                 let gv = self.expr(g)?;
                 let body_bb = self.new_block();
@@ -880,16 +911,13 @@ impl<'a> Lowerer<'a> {
     }
 
     /// Emits tests for `pat` against `place`; on failure control goes to `fail`.
-    /// On return, `self.cur` is the success block. Bound names are assigned into `binds`.
-    fn test_pat(&mut self, pat: &Pattern, place: &Place, fail: BlockId, binds: &HashMap<String, LocalId>) {
+    /// On return, `self.cur` is the success block. Binds nothing (see `bind_case`).
+    fn test_pat(&mut self, pat: &Pattern, place: &Place, fail: BlockId) {
         let place = if self.info.pat_deref.contains(&pat.id) { place.deref() } else { place.clone() };
         match &pat.kind {
             PatKind::Wild => {}
-            PatKind::Bind(name) => self.assign_binding(binds[name], pat, &place),
-            PatKind::At(name, inner) => {
-                self.assign_binding(binds[name], pat, &place);
-                self.test_pat(inner, &place, fail, binds);
-            }
+            PatKind::Bind(_) => {}
+            PatKind::At(_, inner) => self.test_pat(inner, &place, fail),
             PatKind::Lit(l) => {
                 let c = match l {
                     Lit::Int(v) => Const::Int(*v),
@@ -905,7 +933,7 @@ impl<'a> Lowerer<'a> {
             }
             PatKind::Tuple(ps) => {
                 for (i, p) in ps.iter().enumerate() {
-                    self.test_pat(p, &place.field(i), fail, binds);
+                    self.test_pat(p, &place.field(i), fail);
                 }
             }
             PatKind::Variant { name, fields } => {
@@ -918,7 +946,7 @@ impl<'a> Lowerer<'a> {
                     self.cur = next;
                 }
                 for (i, p) in fields.iter().enumerate() {
-                    self.test_pat(p, &place.downcast(idx, i), fail, binds);
+                    self.test_pat(p, &place.downcast(idx, i), fail);
                 }
             }
             PatKind::Struct { name, fields } => {
@@ -933,14 +961,17 @@ impl<'a> Lowerer<'a> {
                 }
                 for (fname, p) in fields {
                     let sub = self.field_place(name, fname, &place);
-                    self.test_pat(p, &sub, fail, binds);
+                    self.test_pat(p, &sub, fail);
                 }
             }
             PatKind::Or(alts) => {
                 let success = self.new_block();
+                let sel = self.temp(Type::con("Int"));
+                self.or_sel.insert(pat.id, sel);
                 for (i, alt) in alts.iter().enumerate() {
                     let next_alt = if i + 1 < alts.len() { self.new_block() } else { fail };
-                    self.test_pat(alt, &place, next_alt, binds);
+                    self.test_pat(alt, &place, next_alt);
+                    self.assign(sel, Rvalue::Use(Operand::Const(Const::Int(i as i64))));
                     self.terminate(Terminator::Goto(success));
                     if i + 1 < alts.len() {
                         self.cur = next_alt;

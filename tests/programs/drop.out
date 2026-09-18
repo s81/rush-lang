@@ -6,5 +6,10 @@ drop c
 maybe done
 maybe done
 drop c
+drop x
+picked y
+drop y
+picked z
+drop z
 end of main
 drop b2

@@ -402,4 +402,10 @@ mod tests {
         run("def main\n  let s = \"a\"\n  puts(&s)\n  puts(&s)\nend\n").unwrap();
         assert_eq!(err("def main\n  let t = (\"a\", \"b\")\n  let (a, b) = t\n  let u = t\n  ()\nend\n"), "use of moved value `t`");
     }
+
+    #[test]
+    fn pattern_tests_run_before_bindings_move() {
+        run("def main\n  let t = (int_to_s(1), 0)\n  let r = case t\n  in (s, 0) then 1\n  in _ then 2\n  end\n  ()\nend\n").unwrap();
+        run("def main\n  let o = Some(int_to_s(1))\n  let r = case o\n  in x @ Some(_) then 1\n  in None then 2\n  end\n  ()\nend\n").unwrap();
+    }
 }
