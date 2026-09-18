@@ -1,5 +1,6 @@
-in if
+in nested if
 drop inner2
+in if
 drop inner1
 after if
 drop loop 0
@@ -8,10 +9,12 @@ after loop
 temp
 drop temp
 after temp
+held
 drop re 1
 drop early b
 drop early a
 drop early a
 end of main
 drop re 2
+drop held
 drop outer

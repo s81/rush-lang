@@ -10,18 +10,18 @@ def main
   puts("#{a.n} #{b.n}")              # 1 1
   let m = g.borrow_mut               # a and b are dead: their borrows were released
   m.n += 1
-  let r = g.borrow
-  if r.n > 5
-    puts("big")
-  else
-    puts("small")                    # small
+  let mut k = 0
+  while k < 2
+    let r = g.borrow
+    if k == 0
+      puts(&int_to_s(r.n))           # 2: r is used on this branch only
+    else
+      puts("no use")                 # r is released on entry to this branch
+    end
+    let w = g.borrow_mut             # r released on both paths
+    w.n += 1
+    k += 1
   end
-  let w = g.borrow_mut               # r released on both branches
-  w.n = 7
-  let mut i = 0
-  while i < 2
-    let c = g.borrow
-    puts(&int_to_s(c.n))             # 7, 7
-    i += 1
-  end
+  let c = g.borrow
+  puts(&int_to_s(c.n))               # 4
 end

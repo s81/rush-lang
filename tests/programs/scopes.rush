@@ -25,7 +25,10 @@ def main
   let outer = Noisy { name: "outer" }
   if true
     let inner1 = Noisy { name: "inner1" }
-    let inner2 = Noisy { name: "inner2" }
+    if true
+      let inner2 = Noisy { name: "inner2" }
+      puts("in nested if")
+    end
     puts("in if")
   end
   puts("after if")
@@ -37,6 +40,8 @@ def main
   puts("after loop")
   puts(&make("temp").name)
   puts("after temp")
+  let held = &make("held").name      # a let initializer's temporary lives to the end of main
+  puts(held)
   let mut re = Noisy { name: "re 1" }
   re = Noisy { name: "re 2" }
   early(true)
