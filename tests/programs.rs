@@ -46,9 +46,9 @@ fn error_programs_report_expected_diagnostic() {
         let out = rush(&["build", file], dir);
         assert_eq!(out.status.code(), Some(1), "{file}: expected exit code 1");
         let stderr = String::from_utf8_lossy(&out.stderr).replace("\r\n", "\n");
-        assert!(
-            stderr.contains(expected.trim_end()),
-            "{file}: stderr was:\n{stderr}\nexpected to contain:\n{expected}"
-        );
+        // Each line of the .err file (the error, then any notes) must appear in stderr.
+        for line in expected.lines().filter(|l| !l.trim().is_empty()) {
+            assert!(stderr.contains(line), "{file}: stderr was:\n{stderr}\nexpected to contain:\n{line}");
+        }
     }
 }

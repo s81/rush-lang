@@ -81,11 +81,19 @@ impl<'a> Ck<'a> {
         if n.is_empty() || n == "_ret" { "value".to_string() } else { format!("`{n}`") }
     }
 
+    fn moved(&self, l: LocalId, span: Span) -> Diagnostic {
+        let d = Diagnostic::new(span, format!("use of moved value {}", self.name(l)));
+        match self.move_spans.get(&l) {
+            Some(&m) => d.with_note(m, "value moved here"),
+            None => d,
+        }
+    }
+
     /// Checks a read of a place; errors if its root may have been moved.
     fn read(&self, st: &State, p: &Place, span: Span) -> Result<(), Diagnostic> {
         let l = p.local as usize;
         if self.tracked[l] && (st.dead[l] || st.partial[l]) {
-            return Err(Diagnostic::new(span, format!("use of moved value {}", self.name(p.local))));
+            return Err(self.moved(p.local, span));
         }
         Ok(())
     }
@@ -94,7 +102,7 @@ impl<'a> Ck<'a> {
     fn read_for_move_out(&self, st: &State, p: &Place, span: Span) -> Result<(), Diagnostic> {
         let l = p.local as usize;
         if self.tracked[l] && (st.dead[l] || (st.partial[l] && p.proj.is_empty())) {
-            return Err(Diagnostic::new(span, format!("use of moved value {}", self.name(p.local))));
+            return Err(self.moved(p.local, span));
         }
         Ok(())
     }

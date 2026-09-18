@@ -1,1 +1,2 @@
 error: use of moved value `p`
+note: value moved here
