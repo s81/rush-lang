@@ -89,6 +89,17 @@ static void body(void) {
     rush_str_drop(&owned);
     rush_str_drop(&lit);
     if (rush_add_i64_checked(1, 2) != 3 || rush_mul_i64_checked(-3, 4) != -12) return;
+    /* Runtime borrow flags: shared borrows stack, a mutable one needs them all released. The
+       panicking paths are covered by tests/programs/gc_conflict.rush. */
+    pair *b = (pair *)rush_gc_alloc(sizeof(pair), NULL);
+    rush_gc_borrow(b);
+    rush_gc_borrow(b);
+    rush_gc_release(b, false);
+    rush_gc_release(b, false);
+    rush_gc_borrow_mut(b);
+    rush_gc_release(b, true);
+    if (rush_gc_borrow(b) != b) return;
+    rush_gc_release(b, false);
     make_cycles();
     rush_gc_collect();
     if (cycle_drops < 1990 || bad_peers != 0 || reentered != 0) {

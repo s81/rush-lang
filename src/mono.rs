@@ -36,7 +36,7 @@ pub fn mangle_fn(name: &str, targs: &[Type]) -> String {
 }
 
 pub fn is_intrinsic(name: &str) -> bool {
-    matches!(name, "Gc::new" | "Gc::borrow" | "Gc::borrow_mut")
+    matches!(name, "Gc::new" | "Gc::borrow" | "Gc::borrow_mut" | "Gc::release")
 }
 
 fn type_size(t: &Type) -> usize {
@@ -127,9 +127,18 @@ impl<'a> Mono<'a> {
             for s in &bb.stmts {
                 let s = match s {
                     Statement::Drop(p, sp) => Statement::Drop(p.clone(), *sp),
+                    Statement::StorageDead(l, sp) => Statement::StorageDead(*l, *sp),
                     Statement::Assign(place, rv, sp) => {
                         let rv = match rv {
-                            Rvalue::Call(c, ops) => Rvalue::Call(self.callee(c, &map)?, ops.clone()),
+                            Rvalue::Call(c, ops) => {
+                                let c = self.callee(c, &map)?;
+                                if let Callee::Def { name, targs } = &c {
+                                    if name == "Gc::new" && self.info.contains_ref(&targs[0]) {
+                                        return Err(Diagnostic::new(*sp, "cannot store a value holding references in `Gc`"));
+                                    }
+                                }
+                                Rvalue::Call(c, ops.clone())
+                            }
                             Rvalue::Aggregate(agg, ops) => {
                                 let agg = match agg {
                                     Agg::Struct(t) => Agg::Struct(subst(t, &map)),
@@ -244,6 +253,14 @@ mod tests {
         let mut bodies = lower(&p, &info)?;
         crate::ownck::check_and_insert_drops(&mut bodies, &info)?;
         monomorphize(bodies, &info)
+    }
+
+    #[test]
+    fn gc_rejects_values_holding_references_even_through_generics() {
+        let msg = "cannot store a value holding references in `Gc`";
+        assert_eq!(mono_src("def main\n  let s = int_to_s(1)\n  let g = Gc.new(&s)\n  ()\nend\n").unwrap_err().msg, msg);
+        let generic = "def wrap[T](x: T) -> Gc[T]\n  Gc.new(x)\nend\ndef main\n  let s = int_to_s(1)\n  let g = wrap(Some(&s))\n  ()\nend\n";
+        assert_eq!(mono_src(generic).unwrap_err().msg, msg);
     }
 
     fn names(s: &str) -> Vec<String> {

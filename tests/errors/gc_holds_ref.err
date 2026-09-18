@@ -1,0 +1,1 @@
+error: cannot store a value holding references in `Gc`

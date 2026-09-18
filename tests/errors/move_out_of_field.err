@@ -1,1 +1,1 @@
-error: cannot move out of `p.0`; use `.clone`
+error: cannot move out of `p.name`; use `.clone`

@@ -68,6 +68,32 @@ def main
 end
 ```
 
+Borrows are checked: a place has one live `&mut` or any number of live `&`, and a borrow
+ends at its last use. A function returning a reference borrows from `self` or its one
+reference parameter.
+
+```ruby
+impl Person
+  def name_ref(&self) -> &String   # the result borrows self
+    &@name
+  end
+  def set_age(&mut self, a: Int)
+    @age = a
+  end
+end
+
+def main
+  let mut p = Person { name: "Ann", age: 30 }
+  let n = p.name_ref
+  puts(n)                   # Ann
+  p.set_age(p.age + 1)      # fine: n is dead, and the receiver is borrowed after the argument
+  let r = &mut p
+  # puts(&p.name)           # error: cannot borrow `p.name` as shared because it is mutably borrowed
+  r.set_age(40)
+  puts("#{p}")              # Person { name: "Ann", age: 40 }
+end
+```
+
 ## Build
 
     export PATH="$HOME/.cargo/bin:$PATH"   # Git Bash on Windows

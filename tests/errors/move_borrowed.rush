@@ -1,0 +1,13 @@
+struct P
+  name: String
+end
+
+def take(p: P)
+end
+
+def main
+  let p = P { name: "a" }
+  let r = &p
+  take(p)
+  puts(&r.name)
+end

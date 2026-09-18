@@ -1,0 +1,9 @@
+def dangle(s: &String) -> &String
+  let local = "x"
+  &local
+end
+
+def main
+  let s = "a"
+  puts(dangle(&s))
+end

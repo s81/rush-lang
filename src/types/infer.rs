@@ -461,6 +461,19 @@ impl<'a> Checker<'a> {
                 self.reject_unresolved_pending()?;
             }
         }
+        // Elision needs final signatures, which unannotated defs only have now.
+        for job in &jobs {
+            let g = &self.info.globals[&job.global];
+            let ty = self.inf.resolve(&g.scheme.ty);
+            let (params, ret) = ty.uncurry_n(g.n_params);
+            match self.info.elide(&params, job.def.self_param.is_some(), &ret) {
+                Ok(Some(i)) => {
+                    self.info.elided.insert(job.global.clone(), i);
+                }
+                Ok(None) => {}
+                Err(()) => return Err(super::decls::elision_error(job.def)),
+            }
+        }
         Ok(())
     }
 
@@ -498,15 +511,6 @@ impl<'a> Checker<'a> {
         };
         self.inf.unify(&ret, &body_ty, last_span(&job.def.body, job.def.span))?;
         self.solve_pending()?;
-        // Inferred signatures get the same Plan 3a limits as annotated ones: no reference may
-        // leave the function through its result or be written behind a `&mut` parameter.
-        let span = job.def.ret.as_ref().map(|t| t.span()).unwrap_or(job.def.span);
-        super::decls::no_refs(&self.inf.resolve(&ret), span)?;
-        for p in g.scheme.ty.uncurry_n(g.n_params).0 {
-            if let Some((true, inner)) = self.inf.resolve(&p).as_ref() {
-                super::decls::no_refs(inner, span)?;
-            }
-        }
         if !job.generalize {
             // Declared generics: every remaining variable must have been fixed by the body.
             let ty = self.inf.resolve(&g.scheme.ty);
@@ -1740,13 +1744,27 @@ mod tests {
     }
 
     #[test]
-    fn references_rejected_in_fields_and_returns() {
-        assert_eq!(err("struct S\n  r: &Int\nend\ndef main\n  ()\nend\n"), "references in this position are not supported until Plan 3b");
-        assert_eq!(err("def f(x: &Int) -> &Int\n  x\nend\ndef main\n  ()\nend\n"), "references in this position are not supported until Plan 3b");
-        let msg = "references in this position are not supported until Plan 3b";
-        assert_eq!(err("def f\n  let s = int_to_s(1)\n  &s\nend\ndef main\n  ()\nend\n"), msg);
-        assert_eq!(err("def f\n  let s = int_to_s(1)\n  Some(&s)\nend\ndef main\n  ()\nend\n"), msg);
-        assert_eq!(err("def f(o: &mut Option[&String])\n  ()\nend\ndef main\n  ()\nend\n"), msg);
+    fn borrowing_types_and_mut_refs_are_not_copy() {
+        let info = check_src("struct Words\n  first: &String\n  rest: &String\nend\nstruct Box[T]\n  v: T\nend\ndef main\n  ()\nend\n").unwrap();
+        assert!(info.contains_ref(&Type::con("Words")));
+        assert!(info.contains_ref(&Type::Con("Option".into(), vec![Type::r#ref(false, Type::con("Int"))])));
+        assert!(info.contains_ref(&Type::Con("Box".into(), vec![Type::r#ref(false, Type::con("Int"))])));
+        assert!(!info.contains_ref(&Type::Con("Box".into(), vec![Type::con("Int")])));
+        assert!(!info.contains_ref(&Type::Con("Gc".into(), vec![Type::con("String")])));
+        assert!(info.is_copy(&Type::r#ref(false, Type::con("String")), &|_| false));
+        assert!(!info.is_copy(&Type::r#ref(true, Type::con("Int")), &|_| false));
+    }
+
+    #[test]
+    fn elision_picks_self_or_the_single_reference_parameter() {
+        let info = check_src(&format!("{PERSON}impl Person\n  def name_ref(&self, other: &String) -> &String\n    &@name\n  end\nend\nstruct Words\n  first: &String\nend\ndef pick(n: Int, s: &String) -> Words\n  Words {{ first: s }}\nend\ndef first(s: &String)\n  s\nend\ndef main\n  ()\nend\n")).unwrap();
+        let method = info.impls.iter().find_map(|i| i.methods.get("name_ref")).unwrap();
+        assert_eq!(info.elided.get(method), Some(&0));
+        assert_eq!(info.elided.get("pick"), Some(&1));
+        assert_eq!(info.elided.get("first"), Some(&0), "inferred return types are elided too");
+        let msg = "cannot infer the lifetime of the returned reference; return an owned value instead";
+        assert_eq!(err("def f(a: &String, b: &String) -> &String\n  a\nend\ndef main\n  ()\nend\n"), msg);
+        assert_eq!(err("def f -> &String\n  let s = int_to_s(1)\n  &s\nend\ndef main\n  ()\nend\n"), msg);
     }
 
     #[test]

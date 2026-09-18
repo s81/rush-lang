@@ -4,3 +4,4 @@ target/
 tests/programs/*
 !tests/programs/*.rush
 !tests/programs/*.out
+!tests/programs/*.err

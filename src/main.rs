@@ -1,4 +1,5 @@
 mod ast;
+mod borrowck;
 mod cgen;
 mod derive;
 mod diag;

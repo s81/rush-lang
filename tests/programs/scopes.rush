@@ -1,0 +1,50 @@
+struct Noisy
+  name: String
+end
+
+impl Drop for Noisy
+  def drop(&mut self)
+    puts("drop #{@name}")
+  end
+end
+
+def early(flag: Bool) -> Int
+  let a = Noisy { name: "early a" }
+  if flag
+    let b = Noisy { name: "early b" }
+    return 1
+  end
+  2
+end
+
+def make(name: String) -> Noisy
+  Noisy { name: name }
+end
+
+def main
+  let outer = Noisy { name: "outer" }
+  if true
+    let inner1 = Noisy { name: "inner1" }
+    if true
+      let inner2 = Noisy { name: "inner2" }
+      puts("in nested if")
+    end
+    puts("in if")
+  end
+  puts("after if")
+  let mut i = 0
+  while i < 2
+    let l = Noisy { name: "loop #{i}" }
+    i += 1
+  end
+  puts("after loop")
+  puts(&make("temp").name)
+  puts("after temp")
+  let held = &make("held").name      # a let initializer's temporary lives to the end of main
+  puts(held)
+  let mut re = Noisy { name: "re 1" }
+  re = Noisy { name: "re 2" }
+  early(true)
+  early(false)
+  puts("end of main")
+end

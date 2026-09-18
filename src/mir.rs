@@ -72,6 +72,8 @@ pub enum Statement {
     Assign(Place, Rvalue, Span),
     /// Runs the drop glue of the value in the place (a no-op for types with nothing to free).
     Drop(Place, Span),
+    /// The local's scope ends here: ownck drops it if still owned, borrowck ends its loans.
+    StorageDead(LocalId, Span),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -161,6 +163,70 @@ pub fn place_type(info: &TypeInfo, body: &Body, p: &Place) -> Type {
     ty
 }
 
+/// Emits a chain of blocks that replaces one original block (used by passes that insert
+/// guarded statements).
+pub(crate) struct Emit {
+    pub chunks: Vec<(BlockId, Vec<Statement>, Terminator)>,
+    pub cur_id: BlockId,
+    pub cur: Vec<Statement>,
+    pub next: BlockId,
+}
+
+impl Emit {
+    pub fn alloc(&mut self) -> BlockId {
+        let id = self.next;
+        self.next += 1;
+        id
+    }
+    /// `if flag then stmts`; continues in a fresh block.
+    pub fn guarded(&mut self, flag: LocalId, stmts: Vec<Statement>) {
+        let then_bb = self.alloc();
+        let cont_bb = self.alloc();
+        let before = std::mem::take(&mut self.cur);
+        self.chunks.push((self.cur_id, before, Terminator::If(Operand::local(flag), then_bb, cont_bb)));
+        self.chunks.push((then_bb, stmts, Terminator::Goto(cont_bb)));
+        self.cur_id = cont_bb;
+    }
+    pub fn finish(mut self, term: Terminator) -> Vec<(BlockId, Vec<Statement>, Terminator)> {
+        let stmts = std::mem::take(&mut self.cur);
+        self.chunks.push((self.cur_id, stmts, term));
+        self.chunks
+    }
+}
+
+/// Source-like path of a place for messages: `p.name`, `t.0`, `*r`. Field access through a
+/// reference is shown auto-dereferenced, as it is written.
+pub fn describe_place(info: &TypeInfo, body: &Body, p: &Place) -> String {
+    let mut s = body.locals[p.local as usize].name.clone();
+    if s.is_empty() || s == "_ret" {
+        s = "value".into();
+    }
+    let mut ty = body.locals[p.local as usize].ty.clone();
+    for (i, pr) in p.proj.iter().enumerate() {
+        let name = |fields: Option<&str>, k: usize| fields.map(str::to_string).unwrap_or(k.to_string());
+        match pr {
+            Proj::Deref if i + 1 == p.proj.len() => s = format!("*{s}"),
+            Proj::Deref => {}
+            Proj::Field(k) => {
+                let f = match &ty {
+                    Type::Con(n, _) => info.structs.get(n).map(|st| st.fields[*k].0.as_str()),
+                    _ => None,
+                };
+                s = format!("{s}.{}", name(f, *k));
+            }
+            Proj::Downcast(v, k) => {
+                let f = match &ty {
+                    Type::Con(n, _) => info.enums.get(n).and_then(|e| e.variants[*v].fields[*k].0.as_deref()),
+                    _ => None,
+                };
+                s = format!("{s}.{}", name(f, *k));
+            }
+        }
+        ty = place_type(info, body, &Place { local: p.local, proj: p.proj[..=i].to_vec() });
+    }
+    s
+}
+
 /// Lowers every user def, impl method, and trait default method.
 pub fn lower(prog: &Program, info: &TypeInfo) -> Result<Vec<Body>, Diagnostic> {
     let mut out = Vec::new();
@@ -202,6 +268,8 @@ struct Lowerer<'a> {
     copy_params: Vec<String>,
     /// Or-pattern -> local holding the index of the alternative that matched.
     or_sel: HashMap<PatId, LocalId>,
+    /// Locals created in each open scope, in creation order; parallel to `scopes`.
+    owned: Vec<Vec<LocalId>>,
 }
 
 fn lower_def(global: &str, d: &Def, info: &TypeInfo) -> Result<Body, Diagnostic> {
@@ -221,6 +289,7 @@ fn lower_def(global: &str, d: &Def, info: &TypeInfo) -> Result<Body, Diagnostic>
         span: d.span,
         copy_params,
         or_sel: HashMap::new(),
+        owned: vec![vec![]],
     };
     let mut params = params.into_iter();
     if d.self_param.is_some() {
@@ -240,7 +309,69 @@ fn lower_def(global: &str, d: &Def, info: &TypeInfo) -> Result<Body, Diagnostic>
 impl<'a> Lowerer<'a> {
     fn new_local(&mut self, name: &str, ty: Type) -> LocalId {
         self.body.locals.push(Local { name: name.to_string(), ty });
-        self.body.locals.len() as LocalId - 1
+        let id = self.body.locals.len() as LocalId - 1;
+        self.owned.last_mut().unwrap().push(id);
+        id
+    }
+    fn push_scope(&mut self) {
+        self.scopes.push(HashMap::new());
+        self.owned.push(vec![]);
+    }
+    /// Ends a scope: its locals die in reverse creation order, except the scope's value `v`,
+    /// which is handed to the parent scope.
+    fn pop_scope(&mut self, v: Operand) -> Operand {
+        self.scopes.pop();
+        let owned = self.owned.pop().unwrap();
+        let v = self.detach(v, &owned);
+        self.kill(&owned, &v);
+        v
+    }
+    /// Makes a scope's value independent of the scope's locals: a plain temp moves to the
+    /// parent scope; a named local or a projection is copied (or moved) into a parent temp.
+    fn detach(&mut self, v: Operand, owned: &[LocalId]) -> Operand {
+        let Operand::Place(p) = &v else { return v };
+        if !owned.contains(&p.local) {
+            return v;
+        }
+        if p.proj.is_empty() && self.body.locals[p.local as usize].name.is_empty() {
+            self.owned.last_mut().unwrap().push(p.local);
+            return v;
+        }
+        let ty = self.place_ty(p);
+        self.eval_to_temp(ty, Rvalue::Use(v))
+    }
+    /// Emits `StorageDead` for `locals` in reverse order, skipping the local behind `keep`.
+    fn kill(&mut self, locals: &[LocalId], keep: &Operand) {
+        let keep = match keep {
+            Operand::Place(p) if p.proj.is_empty() => Some(p.local),
+            _ => None,
+        };
+        for &l in locals.iter().rev() {
+            if Some(l) != keep {
+                let span = self.span;
+                self.push(Statement::StorageDead(l, span));
+            }
+        }
+    }
+    /// A `&mut` place passed to a call is reborrowed (`&mut *r`) instead of moved.
+    fn reborrow(&mut self, op: Operand, ty: &Type) -> Operand {
+        match (&op, ty.as_ref()) {
+            (Operand::Place(p), Some((true, inner))) if !p.proj.is_empty() || !self.body.locals[p.local as usize].name.is_empty() => {
+                let t = Type::r#ref(true, inner.clone());
+                let place = p.deref();
+                self.eval_to_temp(t, Rvalue::Ref(true, place))
+            }
+            _ => op,
+        }
+    }
+    /// Lowers a call argument, reborrowing `&mut` places.
+    fn arg(&mut self, a: &Expr) -> Result<Operand, Diagnostic> {
+        let v = self.expr(a)?;
+        if self.info.derefs.contains(&a.id) || self.info.autorefs.contains_key(&a.id) {
+            return Ok(v);
+        }
+        let ty = self.ty(a);
+        Ok(self.reborrow(v, &ty))
     }
     fn temp(&mut self, ty: Type) -> LocalId {
         self.new_local("", ty)
@@ -310,7 +441,7 @@ impl<'a> Lowerer<'a> {
     }
 
     fn block(&mut self, b: &Block) -> Result<Operand, Diagnostic> {
-        self.scopes.push(HashMap::new());
+        self.push_scope();
         let mut last = Operand::Const(Const::Unit);
         for (i, s) in b.stmts.iter().enumerate() {
             match s {
@@ -334,13 +465,22 @@ impl<'a> Lowerer<'a> {
                     last = Operand::Const(Const::Unit);
                 }
                 Stmt::Expr(e) => {
+                    let mark = self.owned.last().unwrap().len();
                     let v = self.expr(e)?;
-                    last = if i + 1 == b.stmts.len() { v } else { Operand::Const(Const::Unit) };
+                    if i + 1 == b.stmts.len() {
+                        last = v;
+                    } else {
+                        // Temporaries of an expression statement die at its end.
+                        self.span = e.span;
+                        let temps = self.owned.last_mut().unwrap().split_off(mark);
+                        self.kill(&temps, &Operand::Const(Const::Unit));
+                        last = Operand::Const(Const::Unit);
+                    }
                 }
             }
         }
-        self.scopes.pop();
-        Ok(last)
+        self.span = b.span;
+        Ok(self.pop_scope(last))
     }
 
     /// Allocates one local per bound name (shared by or-alternatives) in the current scope.
@@ -408,14 +548,6 @@ impl<'a> Lowerer<'a> {
             }
         }
         self.cur = join;
-    }
-
-    /// Creates the local for a binding and assigns it (by reference, move, or copy).
-    fn bind_local(&mut self, pat: &Pattern, name: &str, place: &Place) -> LocalId {
-        let ty = self.info.pat_types[&pat.id].clone();
-        let id = self.new_local(name, ty);
-        self.assign_binding(id, pat, place);
-        id
     }
 
     fn assign_binding(&mut self, id: LocalId, pat: &Pattern, place: &Place) {
@@ -609,7 +741,7 @@ impl<'a> Lowerer<'a> {
                 if let DotRes::Assoc { global, targs } = res {
                     let mut ops = Vec::new();
                     for a in args.as_deref().unwrap_or(&[]) {
-                        ops.push(self.expr(a)?);
+                        ops.push(self.arg(a)?);
                     }
                     if ops.len() != self.info.globals[&global].n_params {
                         return Err(Diagnostic::new(e.span, "partial application is not supported in this version"));
@@ -618,7 +750,9 @@ impl<'a> Lowerer<'a> {
                     return Ok(self.eval_to_temp(ty, Rvalue::Call(Callee::Def { name: global, targs }, ops)));
                 }
                 let rv = self.expr(recv)?;
-                let rv = self.adjusted_recv(recv, rv);
+                // Two-phase: a `&mut self` auto-borrow is taken after the arguments are evaluated.
+                let two_phase = matches!(res, DotRes::Method(_)) && self.info.adjust.get(&recv.id) == Some(&Adjust::AutoRef(true));
+                let rv = if two_phase { rv } else { self.adjusted_recv(recv, rv) };
                 match res {
                     DotRes::Field(i) => {
                         let rty = self.adjusted_ty(recv);
@@ -638,10 +772,16 @@ impl<'a> Lowerer<'a> {
                             let msg = if args.len() + 1 < n_params { "partial application is not supported in this version" } else { "too many arguments" };
                             return Err(Diagnostic::new(e.span, msg));
                         }
-                        let mut ops = vec![rv];
+                        let mut ops = vec![Operand::Const(Const::Unit)];
                         for a in args {
-                            ops.push(self.expr(a)?);
+                            ops.push(self.arg(a)?);
                         }
+                        ops[0] = if two_phase {
+                            self.adjusted_recv(recv, rv)
+                        } else {
+                            let rty = self.adjusted_ty(recv);
+                            self.reborrow(rv, &rty)
+                        };
                         let ty = self.ty(e);
                         self.eval_to_temp(ty, Rvalue::Call(callee, ops))
                     }
@@ -734,10 +874,12 @@ impl<'a> Lowerer<'a> {
                 if args.len() != g.n_params {
                     return Err(Diagnostic::new(e.span, "partial application is not supported in this version"));
                 }
+                let is_variant = matches!(g.kind, GlobalKind::Variant { .. });
                 let mut ops = Vec::new();
                 for a in args {
-                    ops.push(self.expr(a)?);
+                    ops.push(if is_variant { self.expr(a)? } else { self.arg(a)? });
                 }
+                let g = &self.info.globals[&name];
                 let ty = self.ty(e);
                 if let GlobalKind::Variant { index, .. } = g.kind {
                     return Ok(self.eval_to_temp(ty.clone(), Rvalue::Aggregate(Agg::Variant(ty, index), ops)));
@@ -775,7 +917,14 @@ impl<'a> Lowerer<'a> {
                 let c = self.expr(cond)?;
                 self.terminate(Terminator::If(c, body_bb, exit));
                 self.cur = body_bb;
-                self.block(body)?;
+                let v = self.block(body)?;
+                if let Operand::Place(p) = &v {
+                    let owned = self.owned.last_mut().unwrap();
+                    if p.proj.is_empty() && owned.last() == Some(&p.local) {
+                        owned.pop();
+                        self.kill(&[p.local], &Operand::Const(Const::Unit));
+                    }
+                }
                 self.terminate(Terminator::Goto(head));
                 self.cur = exit;
                 Operand::Const(Const::Unit)
@@ -887,7 +1036,7 @@ impl<'a> Lowerer<'a> {
         for arm in arms {
             self.cur = next_test;
             next_test = self.new_block();
-            self.scopes.push(HashMap::new());
+            self.push_scope();
             let binds = self.declare_binders(&arm.pat);
             self.test_pat(&arm.pat, &splace, next_test);
             self.bind_case(&arm.pat, &splace, &binds);
@@ -900,8 +1049,8 @@ impl<'a> Lowerer<'a> {
             self.drop_uncovered(&arm.pat, &splace);
             let v = self.block(&arm.body)?;
             self.assign(result, Rvalue::Use(v));
+            self.pop_scope(Operand::Const(Const::Unit));
             self.terminate(Terminator::Goto(join));
-            self.scopes.pop();
         }
         // Exhaustiveness guarantees the final failure block is dead.
         self.cur = next_test;
@@ -1043,6 +1192,7 @@ pub fn dump(b: &Body) -> String {
             let args = |ops: &[Operand]| ops.iter().map(fmt_operand).collect::<Vec<_>>().join(", ");
             match st {
                 Statement::Drop(p, _) => writeln!(s, "  drop({})", fmt_place(p)).unwrap(),
+                Statement::StorageDead(l, _) => writeln!(s, "  dead(_{l})").unwrap(),
                 Statement::Assign(place, rv, _) => {
                     let rhs = match rv {
                         Rvalue::Use(o) => fmt_operand(o),
@@ -1105,7 +1255,7 @@ mod tests {
         assert_eq!(
             dump_fn(&format!("def add(a: Int, b: Int) -> Int\n  let c = a + b\n  c * 2\nend\n{MAIN}"), "add"),
             "fn add(_1: Int, _2: Int) -> Int\n\
-             bb0:\n  _3 = Add _1 _2\n  _4 = _3\n  _5 = Mul _4 2\n  _0 = _5\n  return\n"
+             bb0:\n  _3 = Add _1 _2\n  _4 = _3\n  _5 = Mul _4 2\n  dead(_4)\n  dead(_3)\n  _0 = _5\n  return\n"
         );
     }
 
@@ -1116,8 +1266,8 @@ mod tests {
             "fn f(_1: Int) -> Int\n\
              bb0:\n  _2 = Lt _1 2\n  if _2 then bb1 else bb2\n\
              bb1:\n  _3 = _1\n  goto bb3\n\
-             bb2:\n  _4 = Sub _1 1\n  _5 = call f(_4)\n  _3 = _5\n  goto bb3\n\
-             bb3:\n  _0 = _3\n  return\n"
+             bb2:\n  _4 = Sub _1 1\n  _5 = call f(_4)\n  dead(_4)\n  _3 = _5\n  goto bb3\n\
+             bb3:\n  dead(_5)\n  dead(_2)\n  _0 = _3\n  return\n"
         );
     }
 
@@ -1153,7 +1303,7 @@ mod tests {
         assert_eq!(
             dump_fn("struct P\n  x: Int\n  y: Int\nend\ndef main\n  let mut p = P { y: 2, x: 1 }\n  p.x = p.y\n  ()\nend\n", "main"),
             "fn main() -> Unit\n\
-             bb0:\n  _1 = P { 1, 2 }\n  _2 = _1\n  _2.0 = _2.1\n  _0 = ()\n  return\n"
+             bb0:\n  _1 = P { 1, 2 }\n  _2 = _1\n  _2.0 = _2.1\n  dead(_2)\n  dead(_1)\n  _0 = ()\n  return\n"
         );
     }
 
@@ -1166,10 +1316,40 @@ mod tests {
              bb1:\n  _0 = _2\n  return\n\
              bb2:\n  _4 = discr(_1)\n  _5 = Eq _4 0\n  if _5 then bb4 else bb3\n\
              bb3:\n  _9 = discr(_1)\n  _10 = Eq _9 1\n  if _10 then bb6 else bb5\n\
-             bb4:\n  _3 = move (_1 as 0).0\n  _6 = Mul _3 _3\n  _2 = _6\n  goto bb1\n\
+             bb4:\n  _3 = move (_1 as 0).0\n  _6 = Mul _3 _3\n  _2 = _6\n  dead(_6)\n  dead(_5)\n  dead(_4)\n  dead(_3)\n  goto bb1\n\
              bb5:\n  unreachable\n\
-             bb6:\n  _7 = move (_1 as 1).0\n  _8 = move (_1 as 1).1\n  _11 = Mul _7 _8\n  _2 = _11\n  goto bb1\n"
+             bb6:\n  _7 = move (_1 as 1).0\n  _8 = move (_1 as 1).1\n  _11 = Mul _7 _8\n  _2 = _11\n  dead(_11)\n  dead(_10)\n  dead(_9)\n  dead(_8)\n  dead(_7)\n  goto bb1\n"
         );
+    }
+
+    // ----- Plan 3b -----
+
+    #[test]
+    fn scope_locals_die_in_reverse_order_and_arm_locals_at_arm_end() {
+        let d = dump_fn(&format!("def f(c: Bool) -> Int\n  let a = 1\n  let b = 2\n  if c\n    let x = 3\n    x\n  else\n    0\n  end\nend\n{MAIN}"), "f");
+        assert_eq!(
+            d,
+            "fn f(_1: Bool) -> Int\nbb0:\n  _2 = 1\n  _3 = 2\n  if _1 then bb1 else bb2\n\
+             bb1:\n  _5 = 3\n  _6 = _5\n  dead(_5)\n  _4 = _6\n  goto bb3\n\
+             bb2:\n  _4 = 0\n  goto bb3\n\
+             bb3:\n  dead(_6)\n  dead(_3)\n  dead(_2)\n  _0 = _4\n  return\n"
+        );
+    }
+
+    #[test]
+    fn two_phase_receiver_borrows_after_arguments() {
+        let src = format!("struct P\n  age: Int\nend\nimpl P\n  def set(&mut self, a: Int)\n    @age = a\n  end\nend\ndef main\n  let mut p = P {{ age: 1 }}\n  p.set(p.age + 1)\n  ()\nend\n");
+        let d = dump_fn(&src, "main");
+        let add = d.find("= Add ").unwrap();
+        let borrow = d.find("= &mut _").unwrap();
+        assert!(add < borrow, "{d}");
+    }
+
+    #[test]
+    fn mut_reference_arguments_are_reborrowed() {
+        let src = format!("def bump(r: &mut Int)\n  *r = *r + 1\nend\ndef twice(r: &mut Int)\n  bump(r)\n  bump(r)\nend\n{MAIN}");
+        let d = dump_fn(&src, "twice");
+        assert_eq!(d.matches("= &mut (*_1)").count(), 2, "{d}");
     }
 
     // ----- Plan 3a -----

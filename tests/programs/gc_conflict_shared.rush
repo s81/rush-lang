@@ -1,0 +1,12 @@
+struct Counter
+  n: Int
+end
+
+def main
+  let g = Gc.new(Counter { n: 1 })
+  let m = g.borrow_mut
+  puts("before")
+  let a = g.borrow
+  puts(&int_to_s(a.n))
+  m.n = 2
+end

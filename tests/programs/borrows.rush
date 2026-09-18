@@ -1,0 +1,46 @@
+struct Person
+  derive Show
+  name: String
+  age: Int
+end
+
+# One implicit lifetime: both fields borrow from the same place.
+struct Words
+  first: &String
+  rest: &String
+end
+
+impl Person
+  def name_ref(&self) -> &String     # elided: tied to self
+    &@name
+  end
+  def set_age(&mut self, a: Int)
+    @age = a
+  end
+end
+
+def pick(s: &String) -> Words        # elided: tied to s
+  Words { first: s, rest: s }
+end
+
+def bump(r: &mut Int)
+  *r = *r + 1
+end
+
+def main
+  let mut p = Person { name: "Ann", age: 30 }
+  let n = p.name_ref
+  puts(n)                            # Ann
+  p.set_age(p.age + 1)               # n is dead; receiver borrowed after the argument
+  let r = &mut p
+  r.set_age(r.age + 9)
+  puts("#{p}")                       # Person { name: "Ann", age: 40 }
+  let w = pick(&p.name)
+  puts(w.rest)                       # Ann
+  let mut x = 1
+  let m = &mut x
+  bump(m)                            # reborrowed, not moved
+  bump(m)
+  x = x * 10
+  puts(&int_to_s(x))                 # 30
+end

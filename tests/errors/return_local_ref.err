@@ -1,0 +1,2 @@
+error: `local` does not live long enough
+note: `local` is borrowed here

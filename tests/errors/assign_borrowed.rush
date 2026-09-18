@@ -1,0 +1,6 @@
+def main
+  let mut x = 1
+  let a = &x
+  x = 2
+  puts(&int_to_s(*a))
+end

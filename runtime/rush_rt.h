@@ -31,6 +31,10 @@ typedef void (*rush_drop_fn)(void *);
 void *rush_gc_alloc(size_t size, rush_drop_fn drop);
 void rush_gc_collect(void);
 int64_t rush_gc_live_objects(void);
+/* Runtime borrow flags of a Gc payload `p`: a conflicting borrow panics. */
+void *rush_gc_borrow(void *p);
+void *rush_gc_borrow_mut(void *p);
+void rush_gc_release(void *p, bool mut);
 
 /* Primitives declared in std/prelude.rush as extern "C". */
 rush_unit rush_puts(const rush_str *s);

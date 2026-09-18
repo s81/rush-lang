@@ -32,17 +32,10 @@ fn contained_adts(t: &Type, adts: &HashMap<String, usize>, out: &mut Vec<String>
     }
 }
 
-/// Rejects references where Plan 3a cannot track them (fields and return types).
-pub(super) fn no_refs(t: &Type, span: Span) -> Result<(), Diagnostic> {
-    match t {
-        Type::Con(n, _) if n == "&" || n == "&mut" => Err(Diagnostic::new(span, "references in this position are not supported until Plan 3b")),
-        Type::Con(_, args) => args.iter().try_for_each(|a| no_refs(a, span)),
-        Type::Fn(a, b) => {
-            no_refs(a, span)?;
-            no_refs(b, span)
-        }
-        _ => Ok(()),
-    }
+/// Elision failed for a def whose result holds a reference.
+pub(super) fn elision_error(d: &Def) -> Diagnostic {
+    let span = d.ret.as_ref().map(|t| t.span()).unwrap_or(d.span);
+    Diagnostic::new(span, "cannot infer the lifetime of the returned reference; return an owned value instead")
 }
 
 impl<'a> Checker<'a> {
@@ -83,7 +76,6 @@ impl<'a> Checker<'a> {
                             return Err(Diagnostic::new(f.span, format!("duplicate field `{}`", f.name)));
                         }
                         let ft = from_ast(&f.ty, &env)?;
-                        no_refs(&ft, f.span)?;
                         fields.push((f.name.clone(), ft));
                     }
                     self.info.structs.insert(s.name.clone(), StructInfo { generics, fields, span: s.span });
@@ -102,7 +94,6 @@ impl<'a> Checker<'a> {
                             VariantFields::Tuple(tys) => {
                                 for t in tys {
                                     let ft = from_ast(t, &env)?;
-                                    no_refs(&ft, t.span())?;
                                     fields.push((None, ft));
                                 }
                             }
@@ -112,7 +103,6 @@ impl<'a> Checker<'a> {
                                         return Err(Diagnostic::new(f.span, format!("duplicate field `{}`", f.name)));
                                     }
                                     let ft = from_ast(&f.ty, &env)?;
-                                    no_refs(&ft, f.span)?;
                                     fields.push((Some(f.name.clone()), ft));
                                 }
                             }
@@ -192,7 +182,6 @@ impl<'a> Checker<'a> {
             (None, Some((_, r))) => r.clone(),
             (None, None) => Type::unit(),
         };
-        no_refs(&ret, d.ret.as_ref().map(|t| t.span()).unwrap_or(d.span))?;
         Ok((params, ret))
     }
 
@@ -210,7 +199,6 @@ impl<'a> Checker<'a> {
             Some(t) => from_ast(t, &env)?,
             None => Type::unit(),
         };
-        no_refs(&ret, d.ret.as_ref().map(|t| t.span()).unwrap_or(d.span))?;
         Ok((params, ret))
     }
 
@@ -224,6 +212,8 @@ impl<'a> Checker<'a> {
         add("Gc::new", Type::func(&[t.clone()], gc.clone()));
         add("Gc::borrow", Type::func(&[Type::r#ref(false, gc.clone())], Type::r#ref(false, t.clone())));
         add("Gc::borrow_mut", Type::func(&[Type::r#ref(false, gc.clone())], Type::r#ref(true, t.clone())));
+        self.info.elided.insert("Gc::borrow".into(), 0);
+        self.info.elided.insert("Gc::borrow_mut".into(), 0);
         let id = self.info.impls.len();
         let mut methods = HashMap::new();
         methods.insert("borrow".to_string(), "Gc::borrow".to_string());
@@ -266,6 +256,14 @@ impl<'a> Checker<'a> {
                     let global = format!("{}::{}", t.name, m.name);
                     self.info.globals.insert(global.clone(), Global { scheme: scheme.clone(), n_params: params.len(), kind: GlobalKind::TraitDefault { trait_name: t.name.clone() } });
                     self.jobs.push(BodyJob { global, def: m, generics: vars.clone(), bounds: bounds.clone(), self_ty: Some(self_param.clone()), generalize: false });
+                }
+                let (ps, r) = scheme.ty.uncurry_n(params.len());
+                match self.info.elide(&ps, true, &r) {
+                    Ok(Some(i)) => {
+                        self.info.elided.insert(format!("{}::{}", t.name, m.name), i);
+                    }
+                    Ok(None) => {}
+                    Err(()) => return Err(elision_error(m)),
                 }
                 methods.insert(m.name.clone(), MethodSig { scheme, n_params: params.len(), has_default });
             }
@@ -456,11 +454,7 @@ impl<'a> Checker<'a> {
                 });
             }
             let ret = match &d.ret {
-                Some(t) => {
-                    let r = from_ast(t, &env)?;
-                    no_refs(&r, t.span())?;
-                    r
-                }
+                Some(t) => from_ast(t, &env)?,
                 None if is_extern => Type::unit(),
                 None => {
                     annotated = false;

@@ -56,20 +56,6 @@ struct Ck<'a> {
     move_spans: HashMap<LocalId, Span>,
 }
 
-fn describe_place(body: &Body, p: &Place) -> String {
-    let mut s = body.locals[p.local as usize].name.clone();
-    if s.is_empty() {
-        s = "value".into();
-    }
-    for pr in &p.proj {
-        match pr {
-            Proj::Field(i) | Proj::Downcast(_, i) => s = format!("{s}.{i}"),
-            Proj::Deref => s = format!("*{s}"),
-        }
-    }
-    s
-}
-
 impl<'a> Ck<'a> {
     fn is_copy(&self, t: &Type) -> bool {
         let cps = &self.copy_params;
@@ -81,11 +67,19 @@ impl<'a> Ck<'a> {
         if n.is_empty() || n == "_ret" { "value".to_string() } else { format!("`{n}`") }
     }
 
+    fn moved(&self, l: LocalId, span: Span) -> Diagnostic {
+        let d = Diagnostic::new(span, format!("use of moved value {}", self.name(l)));
+        match self.move_spans.get(&l) {
+            Some(&m) => d.with_note(m, "value moved here"),
+            None => d,
+        }
+    }
+
     /// Checks a read of a place; errors if its root may have been moved.
     fn read(&self, st: &State, p: &Place, span: Span) -> Result<(), Diagnostic> {
         let l = p.local as usize;
         if self.tracked[l] && (st.dead[l] || st.partial[l]) {
-            return Err(Diagnostic::new(span, format!("use of moved value {}", self.name(p.local))));
+            return Err(self.moved(p.local, span));
         }
         Ok(())
     }
@@ -94,7 +88,7 @@ impl<'a> Ck<'a> {
     fn read_for_move_out(&self, st: &State, p: &Place, span: Span) -> Result<(), Diagnostic> {
         let l = p.local as usize;
         if self.tracked[l] && (st.dead[l] || (st.partial[l] && p.proj.is_empty())) {
-            return Err(Diagnostic::new(span, format!("use of moved value {}", self.name(p.local))));
+            return Err(self.moved(p.local, span));
         }
         Ok(())
     }
@@ -115,7 +109,7 @@ impl<'a> Ck<'a> {
         if p.proj.contains(&Proj::Deref) {
             return Err(Diagnostic::new(span, "cannot move out of a reference; use `.clone`"));
         }
-        Err(Diagnostic::new(span, format!("cannot move out of `{}`; use `.clone`", describe_place(self.body, p))))
+        Err(Diagnostic::new(span, format!("cannot move out of `{}`; use `.clone`", describe_place(self.info, self.body, p))))
     }
 
     fn read_operand(&self, st: &State, op: &Operand, span: Span) -> Result<(), Diagnostic> {
@@ -129,6 +123,12 @@ impl<'a> Ck<'a> {
     fn step(&mut self, st: &mut State, s: &Statement) -> Result<(), Diagnostic> {
         match s {
             Statement::Drop(..) => Ok(()),
+            Statement::StorageDead(l, _) => {
+                if self.tracked[*l as usize] {
+                    st.set(*l as usize, St::Dead);
+                }
+                Ok(())
+            }
             Statement::Assign(target, rv, span) => {
                 match rv {
                     Rvalue::Use(op) => self.use_operand(st, op, *span)?,
@@ -177,36 +177,6 @@ fn successors(t: &Terminator) -> Vec<BlockId> {
     }
 }
 
-/// Emits a chain of blocks that replaces one original block.
-struct Emit {
-    chunks: Vec<(BlockId, Vec<Statement>, Terminator)>,
-    cur_id: BlockId,
-    cur: Vec<Statement>,
-    next: BlockId,
-}
-
-impl Emit {
-    fn alloc(&mut self) -> BlockId {
-        let id = self.next;
-        self.next += 1;
-        id
-    }
-    /// `if flag then drop(place)`; continues in a fresh block.
-    fn guarded_drop(&mut self, flag: LocalId, place: Place, span: Span) {
-        let drop_bb = self.alloc();
-        let cont_bb = self.alloc();
-        let stmts = std::mem::take(&mut self.cur);
-        self.chunks.push((self.cur_id, stmts, Terminator::If(Operand::local(flag), drop_bb, cont_bb)));
-        self.chunks.push((drop_bb, vec![Statement::Drop(place, span)], Terminator::Goto(cont_bb)));
-        self.cur_id = cont_bb;
-    }
-    fn finish(mut self, term: Terminator) -> Vec<(BlockId, Vec<Statement>, Terminator)> {
-        let stmts = std::mem::take(&mut self.cur);
-        self.chunks.push((self.cur_id, stmts, term));
-        self.chunks
-    }
-}
-
 /// Checks moves and inserts drops into every body.
 pub fn check_and_insert_drops(bodies: &mut [Body], info: &TypeInfo) -> Result<(), Diagnostic> {
     for body in bodies.iter_mut() {
@@ -250,11 +220,17 @@ fn check_body(body: &mut Body, info: &TypeInfo) -> Result<(), Diagnostic> {
             }
         }
     }
-    // Drop flags: one Bool per tracked local.
-    let tracked: Vec<LocalId> = (0..n as LocalId).filter(|&i| ck.tracked[i as usize]).collect();
+    // Drop flags: one Bool per tracked local whose drop may do something. In a generic body a
+    // type parameter may need drop once instantiated.
+    let droppable: Vec<LocalId> = (0..n as LocalId)
+        .filter(|&i| ck.tracked[i as usize] && {
+            let t = &body.locals[i as usize].ty;
+            t.has_param() || info.needs_drop(t)
+        })
+        .collect();
     let mut flag_of: HashMap<LocalId, LocalId> = HashMap::new();
     let mut locals = body.locals.clone();
-    for &l in &tracked {
+    for &l in &droppable {
         let f = locals.len() as LocalId;
         locals.push(Local { name: format!("{}_live", body.locals[l as usize].name), ty: Type::con("Bool") });
         flag_of.insert(l, f);
@@ -270,10 +246,10 @@ fn check_body(body: &mut Body, info: &TypeInfo) -> Result<(), Diagnostic> {
         };
         let mut em = Emit { chunks: vec![], cur_id: bi as BlockId, cur: vec![], next };
         let entry_span = bb.stmts.first().map(|s| match s {
-            Statement::Assign(_, _, sp) | Statement::Drop(_, sp) => *sp,
+            Statement::Assign(_, _, sp) | Statement::Drop(_, sp) | Statement::StorageDead(_, sp) => *sp,
         }).unwrap_or_default();
         if bi == 0 {
-            for &l in &tracked {
+            for &l in &droppable {
                 let live = l as usize >= 1 && l as usize <= body.n_params;
                 em.cur.push(set_flag(l, live, entry_span));
             }
@@ -293,19 +269,30 @@ fn check_body(body: &mut Body, info: &TypeInfo) -> Result<(), Diagnostic> {
                             .collect(),
                         _ => vec![],
                     };
-                    let whole_tracked = target.proj.is_empty() && ck.tracked[target.local as usize];
+                    let whole_tracked = target.proj.is_empty() && flag_of.contains_key(&target.local);
                     let old_live = whole_tracked && (st.live[target.local as usize] || st.partial[target.local as usize]);
                     ck.step(&mut st, s)?;
                     if old_live {
-                        em.guarded_drop(flag_of[&target.local], Place::local(target.local), *span);
+                        em.guarded(flag_of[&target.local], vec![Statement::Drop(Place::local(target.local), *span)]);
                     }
                     em.cur.push(s.clone());
-                    for m in moved {
+                    for m in moved.into_iter().filter(|m| flag_of.contains_key(m)) {
                         em.cur.push(set_flag(m, false, *span));
                     }
                     if whole_tracked {
                         em.cur.push(set_flag(target.local, true, *span));
                     }
+                }
+                Statement::StorageDead(l, span) => {
+                    // Scope end: drop the value if this path may still own it.
+                    let li = *l as usize;
+                    let owned = flag_of.contains_key(l) && (st.live[li] || st.partial[li]);
+                    ck.step(&mut st, s)?;
+                    if owned {
+                        em.guarded(flag_of[l], vec![Statement::Drop(Place::local(*l), *span)]);
+                        em.cur.push(set_flag(*l, false, *span));
+                    }
+                    em.cur.push(s.clone());
                 }
                 Statement::Drop(..) => {
                     ck.step(&mut st, s)?;
@@ -314,8 +301,9 @@ fn check_body(body: &mut Body, info: &TypeInfo) -> Result<(), Diagnostic> {
             }
         }
         if matches!(bb.term, Terminator::Return) {
-            for &l in &tracked {
-                em.guarded_drop(flag_of[&l], Place::local(l), entry_span);
+            // Whatever is still owned is dropped in reverse declaration order.
+            for &l in droppable.iter().rev() {
+                em.guarded(flag_of[&l], vec![Statement::Drop(Place::local(l), entry_span)]);
             }
         }
         next = em.next;
@@ -393,7 +381,7 @@ mod tests {
 
     #[test]
     fn move_out_of_field_and_reference() {
-        assert_eq!(err("struct P\n  name: String\nend\ndef main\n  let p = P { name: \"a\" }\n  let n = p.name\n  ()\nend\n"), "cannot move out of `p.0`; use `.clone`");
+        assert_eq!(err("struct P\n  name: String\nend\ndef main\n  let p = P { name: \"a\" }\n  let n = p.name\n  ()\nend\n"), "cannot move out of `p.name`; use `.clone`");
         assert_eq!(err("def f(p: &String) -> String\n  *p\nend\ndef main\n  ()\nend\n"), "cannot move out of a reference; use `.clone`");
     }
 
@@ -401,6 +389,26 @@ mod tests {
     fn borrow_does_not_move_and_destructuring_partial_move() {
         run("def main\n  let s = \"a\"\n  puts(&s)\n  puts(&s)\nend\n").unwrap();
         assert_eq!(err("def main\n  let t = (\"a\", \"b\")\n  let (a, b) = t\n  let u = t\n  ()\nend\n"), "use of moved value `t`");
+    }
+
+    #[test]
+    fn inner_scope_locals_drop_at_scope_end_and_returns_drop_in_reverse() {
+        let d = dump_fn("def main\n  if true\n    let s = int_to_s(1)\n    ()\n  end\n  puts(\"after\")\nend\n", "main");
+        // `s` is `_3`: the then-branch drops it (guarded by its flag) before joining the code
+        // that calls `puts`.
+        assert!(d.contains("  _8 = true\n  if _8 then bb4 else bb5\n"), "{d}");
+        assert!(d.contains("bb4:\n  drop(_3)\n  goto bb5\nbb5:\n  _8 = false\n  dead(_3)\n  dead(_2)\n  _1 = ()\n  goto bb3\n"), "{d}");
+        let f = dump_fn("def f(a: String, b: String) -> Unit\n  ()\nend\ndef main\n  ()\nend\n", "f");
+        assert!(f.find("drop(_2)").unwrap() < f.find("drop(_1)").unwrap(), "{f}");
+    }
+
+    #[test]
+    fn only_locals_whose_drop_does_something_get_flags() {
+        let bodies = run("def f(r: &mut Int, s: String) -> Unit\n  ()\nend\ndef main\n  ()\nend\n").unwrap();
+        let f = bodies.iter().find(|b| b.name == "f").unwrap();
+        assert!(!f.locals.iter().any(|l| l.name == "r_live"));
+        assert!(f.locals.iter().any(|l| l.name == "s_live"));
+        assert_eq!(err("def f(r: &mut Int) -> Unit\n  let a = r\n  let b = r\n  ()\nend\ndef main\n  ()\nend\n"), "use of moved value `r`");
     }
 
     #[test]

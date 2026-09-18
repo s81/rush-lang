@@ -1,0 +1,2 @@
+error: cannot move out of `p` because it is borrowed
+note: `p` is borrowed here

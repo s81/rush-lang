@@ -39,7 +39,14 @@ Stage 1 delivers the Rust-hosted compiler that compiles and runs real single-thr
 | Call borrows | Named variables need `&x`; temporaries and method receivers auto-borrow |
 | String operators | `+`, `==`, `!=` borrow both operands; `Eq::eq` takes `&Self` |
 | Match ergonomics | `case` on `&T` matches the pointee and binds by reference; `&T` with `T: Copy` reads as `T` |
-| Drops | At function exit and on reassignment (scope-exit drops in 3b) |
+| Drops | At the end of the enclosing lexical scope in reverse declaration order, on `return`, and on reassignment; expression-statement temporaries at the end of the statement, `let` initializer temporaries at the end of the scope (2026-09-18) |
+| References in fields | A type holding references has one implicit lifetime shared by all its reference fields; it cannot go into `Gc` and counts as a reference for elision (2026-09-18) |
+| Gc borrow release | `Gc.borrow`/`borrow_mut` are released at the last use of the returned reference, as computed by the borrow checker (2026-09-18) |
+| Two-phase receivers | An auto-borrowed `&mut self` receiver is borrowed after the arguments are evaluated, so `p.set_age(p.age + 1)` compiles (2026-09-18) |
+| `&mut` moves | `&mut T` is not `Copy`; `let r2 = r` moves `r`, while passing a `&mut` local as an argument or receiver reborrows it (2026-09-18) |
+| Loan precision | Loans are per place with field precision: `&mut p.a` and `&p.b` do not conflict; enum variant fields count as fields (2026-09-18) |
+| Diagnostic notes | Borrow errors point at the conflicting access with a note "`x` is borrowed here"; use after move notes "value moved here"; "does not live long enough" points at the dying variable (2026-09-18) |
+| Generic call loans | A call result holding references takes the elided argument's loans; if only the instantiated return type holds references (`id[T](x: T) -> T` with `&s`), it takes the loans of every argument holding references (2026-09-18) |
 | Literals | String literals are owned `String`s with static storage |
 | Derived Show | Uses `Show.inspect`, which quotes strings; `to_s` does not |
 
@@ -126,8 +133,8 @@ end
 - `&x` creates a shared borrow, `&mut x` a mutable borrow, and `*r` dereferences. At any program point a place has either one live `&mut` or any number of live `&`. A place cannot be moved or assigned while borrowed. Liveness is computed on the MIR control-flow graph, so a borrow ends at its last use, not at scope end.
 - Method receivers auto-borrow: for `def m(&self)` the call `x.m` borrows `&x`; for `&mut self` it borrows `&mut x`; for `self` it moves `x`.
 - Stage 1 has no lifetime syntax. Functions returning a reference follow Rust's elision rules: one reference parameter, or a `&self`/`&mut self` receiver, determines the output lifetime. If elision cannot decide, the compiler reports an error that suggests returning an owned value.
-- Owned heap data (`String`, `List`, `Map`, `StringBuilder`, and any struct or enum containing them) is freed by drop calls the compiler inserts at the last use or scope exit on every control-flow path. User types may implement `Drop` with `def drop(&mut self)`.
-- `Gc[T]` is the only route to shared, cyclic, or long-lived-without-owner data. `Gc.new(v)` moves `v` onto the collected heap and returns a `Copy` handle. `g.borrow` returns `&T` and `g.borrow_mut` returns `&mut T`. Both are checked at runtime with a flag in the object header; a violation panics. The returned reference is borrow-checked at compile time like any other reference.
+- Owned heap data (`String`, `List`, `Map`, `StringBuilder`, and any struct or enum containing them) is freed by drop calls the compiler inserts at scope exit on every control-flow path. User types may implement `Drop` with `def drop(&mut self)`.
+- `Gc[T]` is the only route to shared, cyclic, or long-lived-without-owner data. `Gc.new(v)` moves `v` onto the collected heap and returns a `Copy` handle. `g.borrow` returns `&T` and `g.borrow_mut` returns `&mut T`. Both are checked at runtime with a borrow count in the object header; a violation panics. The returned reference is borrow-checked at compile time like any other reference.
 - Closures capture free variables by shared or mutable reference, whichever the body needs. A closure that escapes its defining scope, meaning it is returned, stored in a struct or `Gc`, or passed where the parameter type carries no borrow, must be a `move` closure or the compiler errors. `move` closures that are stored or returned are allocated on the GC heap; closures passed directly as arguments and not stored are stack-allocated.
 - The GC is a conservative, non-moving, stop-the-world mark-sweep collector in C. It scans the C stack between a recorded base and the current stack pointer, a registered set of global roots, and the bodies of reachable GC objects word by word. Only `Gc[T]` cells and escaping closure environments live on the GC heap, so it stays small. Stage 2 registers each green-thread stack as an additional root range.
 
@@ -211,7 +218,7 @@ Stage 1 is done when the section 6 suite passes on Windows with `tcc`, and the g
 | 1 | Pipeline end to end, primitives, functions, control flow, CLI, golden tests (shipped) |
 | 2 | `struct`, `enum`, `case`/`in` with exhaustiveness, tuples, generics with monomorphization, traits with default methods and supertraits, `Show` interpolation, `Eq` (shipped) |
 | 3a | Ownership: moves, `Copy`/`Clone`/`Drop`, `derive`, drop insertion with flags, references as pointers with auto-ref/auto-deref, `Gc[T]` and the conservative collector, associated functions, debug overflow checks (shipped) |
-| 3b | NLL borrow checker: conflicts, liveness, lifetime elision for returned references, references in fields, `Gc` runtime exclusivity, scope-exit drops |
+| 3b | NLL borrow checker: conflicts, liveness, lifetime elision for returned references, references in fields, `Gc` runtime exclusivity, scope-exit drops (shipped) |
 | 4 | Closures and blocks, `move`, currying and partial application, `\|>`, `?`, `>>=`, `mdo`, `for`, `loop`, ranges, symbols, higher-kinded traits (Functor/Applicative/Monad) |
 | 5 | Stdlib (`List`, `Map`, `StringBuilder`, `Iterator` with associated types, `Ord`, IO), list patterns, `Char`, sized integers, `import`, `rush test`, Linux/macOS verification |
 
@@ -223,7 +230,7 @@ Stage 1 is done when the section 6 suite passes on Windows with `tcc`, and the g
 - Conservative GC may retain garbage that a stack word happens to resemble.
 - When several `Gc` objects die in one collection, a `Drop` that reads another of them sees it already dropped (its strings empty); nothing is freed until every drop has run.
 - No package manager or multi-directory modules.
-- Until Plan 3b, borrows are not checked for conflicts or lifetimes; references cannot appear in fields or return types; `Gc.borrow_mut` has no runtime exclusivity check; drops run at function exit rather than scope exit.
+- Borrow checking has no lifetime syntax; a borrowing type has one lifetime, so borrowing one of its fields extends the others; a generic call unions the loans of its reference-holding arguments.
 - Moving a field out of a struct is only possible by destructuring the whole value in a pattern (`let Pair { first: a, second: b } = p`), never by `p.first` alone.
 - Field names cannot be keywords (`next`, `in`, `type`, ...).
 - Trait method signatures and inherent methods must annotate parameters; a trait impl method may omit types and take them from the trait. A trait signature without a return type returns `Unit`.
