@@ -244,8 +244,10 @@ static void gc_collect_from(uintptr_t stack_top) {
         uintptr_t start = (uintptr_t)(h + 1);
         gc_scan_range(start, start + h->size);
     }
-    /* Sweep. */
+    /* Sweep: unlink every dead object, then run all drops, then free. A drop may read other
+       dead objects (a cycle), so nothing is freed until every drop has run. */
     rush_gc_hdr **link = &gc_objects;
+    rush_gc_hdr *dead = NULL;
     size_t live_bytes = 0;
     while (*link) {
         rush_gc_hdr *h = *link;
@@ -254,21 +256,41 @@ static void gc_collect_from(uintptr_t stack_top) {
             link = &h->next;
         } else {
             *link = h->next;
-            if (h->drop) h->drop(h + 1);
-            free(h);
+            h->next = dead;
+            dead = h;
             gc_count--;
         }
     }
     gc_bytes_since = 0;
     gc_threshold = live_bytes * 2 > (1u << 20) ? live_bytes * 2 : (1u << 20);
+    /* ponytail: a drop that stores a dead object's handle somewhere live resurrects it into a
+       dangling handle; finalizer resurrection needs a second mark pass if it ever matters. */
+    for (rush_gc_hdr *h = dead; h; h = h->next)
+        if (h->drop) h->drop(h + 1);
+    while (dead) {
+        rush_gc_hdr *next = dead->next;
+        free(dead);
+        dead = next;
+    }
 }
 
+/* Set while a collection runs, so drops that allocate cannot re-enter the collector. */
+static int gc_running;
+
 void rush_gc_collect(void) {
+    if (gc_running) return;
+    gc_running = 1;
     jmp_buf regs;
     volatile uintptr_t top;
+#if (defined(__GNUC__) || defined(__clang__)) && !defined(__TINYC__)
+    /* glibc mangles the frame pointer inside jmp_buf; this saves every callee-saved register
+       unmangled in this frame. */
+    __builtin_unwind_init();
+#endif
     setjmp(regs); /* spill callee-saved registers onto this frame */
     top = (uintptr_t)&regs;
     gc_collect_from(top < (uintptr_t)&top ? top : (uintptr_t)&top);
+    gc_running = 0;
 }
 
 void *rush_gc_alloc(size_t size, rush_drop_fn drop) {
