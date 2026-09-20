@@ -1,0 +1,2 @@
+error: cannot use `total` because it is mutably borrowed
+note: `total` is borrowed here

@@ -1,0 +1,2 @@
+error: borrowing closure does not live long enough; use `move` to give it its own environment
+note: the closure is borrowed here

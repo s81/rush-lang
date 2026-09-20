@@ -1,0 +1,68 @@
+def pick(f: &(Int -> Symbol), n: Int) -> Symbol
+  f(n)
+end
+
+def color_name(c: Symbol) -> String
+  case c
+  in :red then "stop"
+  in :green then "go"
+  else "unknown"
+  end
+end
+
+def main
+  let mut sum = 0
+  for i in 1..5                       # inclusive
+    sum += i
+  end
+  let mut ex = 0
+  for i in 1...5                      # exclusive
+    ex += i
+  end
+  puts("#{sum} #{ex}")                # 15 10
+
+  let mut thirds = 0
+  for i in 1..10
+    if i % 3 != 0
+      next
+    end
+    thirds += i
+  end
+  puts("#{thirds}")                   # 3 + 6 + 9
+
+  let mut w = 0
+  let mut acc = 0
+  while w < 6
+    w += 1
+    if w % 2 == 0
+      next
+    end
+    acc += w
+  end
+  puts("#{acc}")                      # 1 + 3 + 5
+
+  let mut n = 0
+  let doubled = loop
+    n += 1
+    if n * n > 20
+      break n * 2
+    end
+  end
+  puts("#{doubled}")                  # 5 * 5 > 20, so 10
+
+  let r = 2..4
+  puts("#{r} #{1...4} #{r.start} #{r.stop} #{r.exclusive}")
+
+  # `return` inside a block leaves the block, not `main`.
+  let tag = do |x: Int|
+    if x < 0
+      return :neg
+    end
+    if x == 0
+      return :zero
+    end
+    :pos
+  end
+  puts("#{pick(&tag, -3)} #{pick(&tag, 0)} #{pick(&tag, 7)}")
+  puts("#{color_name(:red)} #{color_name(:green)} #{color_name(:blue)} #{:blue} #{:blue.inspect}")
+end

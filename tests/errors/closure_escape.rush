@@ -1,0 +1,8 @@
+def keep(f: Int -> Int)
+  ()
+end
+
+def main
+  let base = 1
+  keep { |x| x + base }
+end

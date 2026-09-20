@@ -1,0 +1,1 @@
+error: cannot move captured `s` out of a closure; clone it instead
