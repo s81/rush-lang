@@ -36,6 +36,11 @@ enum Option[T]
   None
 end
 
+enum Result[T, E]
+  Ok(T)
+  Err(E)
+end
+
 # `a..b` includes `stop`; `a...b` excludes it.
 struct Range[T]
   start: T
@@ -104,6 +109,15 @@ impl[T: Show] Show for Option[T]
   end
 end
 
+impl[T: Show, E: Show] Show for Result[T, E]
+  def to_s(&self)
+    case self
+    in Ok(v) then "Ok(#{v})"
+    in Err(e) then "Err(#{e})"
+    end
+  end
+end
+
 impl Eq for Int
   def eq(&self, other: &Int)
     self == other
@@ -145,6 +159,16 @@ impl[T: Eq] Eq for Option[T]
     case (self, other)
     in (Some(a), Some(b)) then a == b
     in (None, None) then true
+    in (_, _) then false
+    end
+  end
+end
+
+impl[T: Eq, E: Eq] Eq for Result[T, E]
+  def eq(&self, other: &Result[T, E])
+    case (self, other)
+    in (Ok(a), Ok(b)) then a == b
+    in (Err(a), Err(b)) then a == b
     in (_, _) then false
     end
   end
@@ -210,6 +234,15 @@ impl[T: Clone] Clone for Option[T]
   end
 end
 
+impl[T: Clone, E: Clone] Clone for Result[T, E]
+  def clone(&self)
+    case self
+    in Ok(v) then Ok(v.clone)
+    in Err(e) then Err(e.clone)
+    end
+  end
+end
+
 impl[T] Clone for Gc[T]
   def clone(&self)
     *self
@@ -217,4 +250,39 @@ impl[T] Clone for Gc[T]
 end
 
 impl[T] Copy for Gc[T]
+end
+
+impl[T, E] Result[T, E]
+  def is_ok?(&self) -> Bool
+    case self
+    in Ok(_) then true
+    in Err(_) then false
+    end
+  end
+
+  def is_err?(&self) -> Bool
+    not self.is_ok?
+  end
+
+  def ok(self) -> Option[T]
+    case self
+    in Ok(v) then Some(v)
+    in Err(_) then None
+    end
+  end
+
+  def unwrap_or(self, default: T) -> T
+    case self
+    in Ok(v) then v
+    in Err(_) then default
+    end
+  end
+end
+
+# An instance over the error type is not expressible, so this is a function.
+def map_err[T, E, F](r: Result[T, E], f: &(E -> F)) -> Result[T, F]
+  case r
+  in Ok(v) then Ok(v)
+  in Err(e) then Err(f(e))
+  end
 end

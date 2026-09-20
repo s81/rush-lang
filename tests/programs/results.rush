@@ -1,0 +1,24 @@
+def to_int(s: &String) -> Result[Int, String]
+  case s
+  in "1" then Ok(1)
+  in "2" then Ok(2)
+  else Err("not a number: #{s}")
+  end
+end
+
+def shout(e: String) -> String
+  "!" + e
+end
+
+def main
+  let good = to_int(&"2")
+  let bad = to_int(&"x")
+  puts("#{good} #{bad}")                       # Ok(2) Err(not a number: x)
+  puts("#{good.is_ok?} #{bad.is_ok?} #{good.is_err?} #{bad.is_err?}")
+  puts("#{good == Ok(2)} #{good == Ok(1)} #{bad == Err("not a number: x")}")
+  let copy = good.clone
+  puts("#{copy} #{copy == good}")              # Ok(2) true
+  puts("#{good.ok} #{to_int(&"y").ok}")        # Some(2) None
+  puts("#{to_int(&"1").unwrap_or(9)} #{to_int(&"z").unwrap_or(9)}")
+  puts("#{map_err(bad.clone, &shout)} #{map_err(to_int(&"1"), { |e| e.clone })}")
+end

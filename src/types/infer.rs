@@ -1849,6 +1849,33 @@ mod tests {
     const PERSON: &str = "struct Person\n  derive Show, Eq, Clone\n  name: String\n  age: Int\nend\n";
 
     #[test]
+    fn result_is_in_the_prelude() {
+        // `Ok(1)` leaves the error type open until something fixes it.
+        assert_eq!(scheme("def ok1
+  Ok(1)
+end
+def main
+  ()
+end
+", "ok1"), "[T0] [] Result[Int, T0]");
+        // An annotation fixes it, and the prelude's instances come with it.
+        check_src("def f -> Result[Int, String]
+  Ok(1)
+end
+def main
+  puts(\"#{f == Ok(1)} #{f.clone.unwrap_or(0)}\")
+end
+").unwrap();
+        assert_eq!(err("def f -> Result[Int, String]
+  Ok(true)
+end
+def main
+  ()
+end
+"), "type mismatch: expected Int, found Bool");
+    }
+
+    #[test]
     fn plan1_basics_still_hold() {
         assert_eq!(scheme("def fib(n: Int) -> Int\n  if n < 2\n    n\n  else\n    fib(n - 1) + fib(n - 2)\n  end\nend\ndef main\n  puts(int_to_s(fib(5)))\nend\n", "fib"), "[] [] Int -> Int");
         assert_eq!(scheme("def inc(x)\n  x + 1\nend\ndef main\n  inc(2)\n  ()\nend\n", "inc"), "[] [] Int -> Int");

@@ -1,0 +1,7 @@
+Ok(2) Err(not a number: x)
+true false false true
+true false true
+Ok(2) true
+Some(2) None
+1 9
+Err(!not a number: x) Ok(1)
