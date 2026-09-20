@@ -94,6 +94,41 @@ def main
 end
 ```
 
+Functions are values and every one of them curries. A block is a closure: `{ |x| ... }` or
+`do |x| ... end`, written after a call to become its last argument. A closure that captures
+borrows what it uses and stays where it is (`&(A -> B)`); `move` gives it its own environment
+on the collected heap, so it can be returned (`A -> B`). `x |> f(a)` supplies the last argument.
+
+```ruby
+def each_to(n: Int, f: &(Int -> Unit))
+  for i in 1..n
+    f(i)
+  end
+end
+
+def adder(k: Int) -> Int -> Int
+  move { |x| x + k }                    # owned: it can be returned
+end
+
+def add(a: Int, b: Int) -> Int
+  a + b
+end
+
+def main
+  let mut total = 0
+  each_to(3) { |i| total += i }         # the block borrows total for the call
+  let inc = add(1)                      # partial application: Int -> Int
+  puts("#{total} #{inc(5)} #{5 |> adder(10)}")   # 6 6 15
+  let found = loop
+    total += 1
+    if total > 8
+      break total
+    end
+  end
+  puts("#{found} #{:done} #{1..3}")     # 9 done 1..3
+end
+```
+
 ## Build
 
     export PATH="$HOME/.cargo/bin:$PATH"   # Git Bash on Windows

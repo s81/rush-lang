@@ -49,6 +49,16 @@ Stage 1 delivers the Rust-hosted compiler that compiles and runs real single-thr
 | Generic call loans | A call result holding references takes the elided argument's loans; if only the instantiated return type holds references (`id[T](x: T) -> T` with `&s`), it takes the loans of every argument holding references (2026-09-18) |
 | Literals | String literals are owned `String`s with static storage |
 | Derived Show | Uses `Show.inspect`, which quotes strings; `to_s` does not |
+| Closure types | `A -> B` is owned: named functions, `move` closures, and closures with no captures. It is `Copy`, its environment is on the GC heap, and it can be stored and returned. A non-`move` closure with captures is `&(A -> B)`: its environment is on the stack and it holds loans on its captures, so it cannot escape (2026-09-18) |
+| Capture modes | Without `move`, a capture is `&mut` when the body assigns to it, borrows it `&mut`, or calls a `&mut self` method on it, a reborrow when the variable is `&mut T`, and `&` otherwise. `move` copies `Copy` captures and moves the rest, and its body may not assign to or mutably borrow one; shared mutable state goes in a `Gc` (2026-09-18) |
+| Call-once closures | None. A closure body cannot move a capture out, so every closure can be called any number of times (2026-09-18) |
+| Function values | Defs, associated functions, methods named through their type (`Shape.area`), and variant constructors are values and curry. Supplying every argument is one indirect call; fewer builds a partial application on the GC heap, and only `Copy` arguments may be bound, since a partial application can be called again (2026-09-18) |
+| `\|>` | `x \|> f(a)` is `f(a, x)` and `x \|> f` is `f(x)`, rewritten in the parser, so `a` is evaluated before `x` (2026-09-18) |
+| Blocks | `{ \|x\| e }`, `do \|x\| ... end`, either with `move`. A block after a call's `)`, after a bare call name, or after a method call is that call's last argument. Standalone, `{` starts a block only before `\|`, which leaves `{ "k" => v }` free for Plan 5 maps (2026-09-18) |
+| Ranges and `for` | `a..b` includes `b` and `a...b` excludes it; a range is `Range[T] { start, stop, exclusive }` and shows as `1..5`. `for` iterates a `Range[Int]` until iterators arrive in Plan 5 (2026-09-18) |
+| `loop` and `break` | `loop` yields the value of its `break e`, and `Unit` without one; `break` in `while` and `for` takes no value. Both `break` and `next` drop the locals of the scopes they leave, in reverse order (2026-09-18) |
+| Symbols | `:name` is a `Copy` `Symbol`, compared with `==` and usable as a `case` pattern (which then needs `_` or `else`). `to_s` is `name`, `inspect` and derived `Show` are `:name` (2026-09-18) |
+| `return` in a block | Returns from the block, as in Rust; `break` and `next` refer to loops inside the block, and outside one are an error (2026-09-18) |
 
 ## 1. Language surface
 
@@ -135,7 +145,7 @@ end
 - Stage 1 has no lifetime syntax. Functions returning a reference follow Rust's elision rules: one reference parameter, or a `&self`/`&mut self` receiver, determines the output lifetime. If elision cannot decide, the compiler reports an error that suggests returning an owned value.
 - Owned heap data (`String`, `List`, `Map`, `StringBuilder`, and any struct or enum containing them) is freed by drop calls the compiler inserts at scope exit on every control-flow path. User types may implement `Drop` with `def drop(&mut self)`.
 - `Gc[T]` is the only route to shared, cyclic, or long-lived-without-owner data. `Gc.new(v)` moves `v` onto the collected heap and returns a `Copy` handle. `g.borrow` returns `&T` and `g.borrow_mut` returns `&mut T`. Both are checked at runtime with a borrow count in the object header; a violation panics. The returned reference is borrow-checked at compile time like any other reference.
-- Closures capture free variables by shared or mutable reference, whichever the body needs. A closure that escapes its defining scope, meaning it is returned, stored in a struct or `Gc`, or passed where the parameter type carries no borrow, must be a `move` closure or the compiler errors. `move` closures that are stored or returned are allocated on the GC heap; closures passed directly as arguments and not stored are stack-allocated.
+- Closures capture free variables by shared or mutable reference, whichever the body needs, or by value with `move`. A closure literal has type `A -> B` when it is `move` or captures nothing, and `&(A -> B)` otherwise. An owned `A -> B` is `Copy`, keeps its environment on the GC heap, and can be stored and returned. A `&(A -> B)` keeps its environment on the stack and holds loans on its captures, so returning it, storing it in a struct or `Gc`, or passing it where the parameter type is owned is a compile error that suggests `move`.
 - The GC is a conservative, non-moving, stop-the-world mark-sweep collector in C. It scans the C stack between a recorded base and the current stack pointer, a registered set of global roots, and the bodies of reachable GC objects word by word. Only `Gc[T]` cells and escaping closure environments live on the GC heap, so it stays small. Stage 2 registers each green-thread stack as an additional root range.
 
 ## 3. Type system
@@ -219,7 +229,8 @@ Stage 1 is done when the section 6 suite passes on Windows with `tcc`, and the g
 | 2 | `struct`, `enum`, `case`/`in` with exhaustiveness, tuples, generics with monomorphization, traits with default methods and supertraits, `Show` interpolation, `Eq` (shipped) |
 | 3a | Ownership: moves, `Copy`/`Clone`/`Drop`, `derive`, drop insertion with flags, references as pointers with auto-ref/auto-deref, `Gc[T]` and the conservative collector, associated functions, debug overflow checks (shipped) |
 | 3b | NLL borrow checker: conflicts, liveness, lifetime elision for returned references, references in fields, `Gc` runtime exclusivity, scope-exit drops (shipped) |
-| 4 | Closures and blocks, `move`, currying and partial application, `\|>`, `?`, `>>=`, `mdo`, `for`, `loop`, ranges, symbols, higher-kinded traits (Functor/Applicative/Monad) |
+| 4a | Closures and blocks, `move`, currying and partial application, `\|>`, function values, `for`, `loop`, `break`/`next`, ranges, symbols (shipped) |
+| 4b | `?`, `Result`, higher-kinded traits (Functor/Applicative/Monad), `>>=`, `mdo` |
 | 5 | Stdlib (`List`, `Map`, `StringBuilder`, `Iterator` with associated types, `Ord`, IO), list patterns, `Char`, sized integers, `import`, `rush test`, Linux/macOS verification |
 
 ## Known corners cut in Stage 1
@@ -236,3 +247,6 @@ Stage 1 is done when the section 6 suite passes on Windows with `tcc`, and the g
 - Trait method signatures and inherent methods must annotate parameters; a trait impl method may omit types and take them from the trait. A trait signature without a return type returns `Unit`.
 - Generic trait methods (a method with its own type parameters) are rejected at monomorphization until a plan needs them.
 - Unannotated mutually recursive functions are inferred monomorphically within their group.
+- `for` iterates over a `Range[Int]` only; iterators and `each`/`map` over collections come in Plan 5.
+- No call-once closures: a closure body cannot move a capture out, and a `move` closure's captures are read-only.
+- Every `move` closure with captures allocates its environment on the GC heap, even when it is passed directly and never stored; escape analysis could keep that case on the stack later.
