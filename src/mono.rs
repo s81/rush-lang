@@ -4,7 +4,7 @@ use std::collections::{HashMap, HashSet};
 
 use crate::diag::{Diagnostic, Span};
 use crate::mir::*;
-use crate::types::{match_pattern, subst, GlobalKind, Type, TypeInfo};
+use crate::types::{arity, match_pattern, subst, GlobalKind, Type, TypeInfo};
 
 /// C-identifier-safe encoding of a ground type.
 pub fn mangle_type(t: &Type) -> String {
@@ -95,6 +95,7 @@ impl<'a> Mono<'a> {
     fn callee(&mut self, c: &Callee, map: &HashMap<String, Type>) -> Result<Callee, Diagnostic> {
         Ok(match c {
             Callee::Extern(n) => Callee::Extern(n.clone()),
+            Callee::Value => Callee::Value,
             Callee::Def { name, targs } => {
                 let targs: Vec<Type> = targs.iter().map(|t| subst(t, map)).collect();
                 if is_intrinsic(name) {
@@ -121,6 +122,7 @@ impl<'a> Mono<'a> {
             locals: body.locals.iter().map(|l| Local { name: l.name.clone(), ty: subst(&l.ty, &map) }).collect(),
             n_params: body.n_params,
             blocks: Vec::new(),
+            captures: body.captures.clone(),
         };
         for bb in &body.blocks {
             let mut stmts = Vec::new();
@@ -130,6 +132,33 @@ impl<'a> Mono<'a> {
                     Statement::StorageDead(l, sp) => Statement::StorageDead(*l, *sp),
                     Statement::Assign(place, rv, sp) => {
                         let rv = match rv {
+                            Rvalue::Aggregate(Agg::Fn { code, alloc }, ops) => {
+                                let code = match code {
+                                    FnCode::Closure { name, targs } => {
+                                        let targs: Vec<Type> = targs.iter().map(|t| subst(t, &map)).collect();
+                                        FnCode::Closure { name: self.request(name, targs), targs: vec![] }
+                                    }
+                                    FnCode::Global(c) => {
+                                        let c = self.callee(c, &map)?;
+                                        self.bound_are_copy(&out, ops, *sp)?;
+                                        FnCode::Global(c)
+                                    }
+                                    FnCode::Variant(t, i) => {
+                                        self.bound_are_copy(&out, ops, *sp)?;
+                                        FnCode::Variant(subst(t, &map), *i)
+                                    }
+                                };
+                                Rvalue::Aggregate(Agg::Fn { code, alloc: *alloc }, ops.clone())
+                            }
+                            Rvalue::Call(Callee::Value, ops) => {
+                                let Operand::Place(fp) = &ops[0] else { unreachable!("function values are places") };
+                                let fty = place_type(self.info, &out, fp);
+                                let fty = fty.as_ref().map(|(_, t)| t.clone()).unwrap_or(fty);
+                                if ops.len() - 1 < arity(&fty) {
+                                    self.bound_are_copy(&out, &ops[1..], *sp)?;
+                                }
+                                Rvalue::Call(Callee::Value, ops.clone())
+                            }
                             Rvalue::Call(c, ops) => {
                                 let c = self.callee(c, &map)?;
                                 if let Callee::Def { name, targs } = &c {
@@ -144,6 +173,7 @@ impl<'a> Mono<'a> {
                                     Agg::Struct(t) => Agg::Struct(subst(t, &map)),
                                     Agg::Tuple(t) => Agg::Tuple(subst(t, &map)),
                                     Agg::Variant(t, i) => Agg::Variant(subst(t, &map), *i),
+                                    Agg::Fn { .. } => unreachable!("handled above"),
                                 };
                                 Rvalue::Aggregate(agg, ops.clone())
                             }
@@ -157,6 +187,19 @@ impl<'a> Mono<'a> {
             out.blocks.push(BasicBlock { stmts, term: bb.term.clone() });
         }
         Ok(out)
+    }
+
+    /// A partial application may be called many times, and each call passes its bound
+    /// arguments by value, so they must be `Copy`.
+    fn bound_are_copy(&self, body: &Body, ops: &[Operand], span: Span) -> Result<(), Diagnostic> {
+        for op in ops {
+            let Operand::Place(p) = op else { continue };
+            let t = place_type(self.info, body, p);
+            if !self.info.is_copy(&t, &|_| false) {
+                return Err(Diagnostic::new(span, format!("cannot partially apply with an argument of type `{t}`: it is not `Copy`, and a partial application may be called more than once")));
+            }
+        }
+        Ok(())
     }
 
     /// Requests the `Drop` impl of every type whose drop glue will call one.
@@ -320,5 +363,12 @@ mod tests {
         let d = dump(main);
         assert!(d.contains("call Gc::new[Int]("), "{d}");
         assert!(d.contains("call Gc::borrow[Int]("), "{d}");
+    }
+
+    #[test]
+    fn partial_applications_hold_only_copy_values() {
+        let err = mono_src("def both(a: String, b: Int) -> Int\n  b\nend\ndef main\n  let s = \"x\"\n  let f = both(s)\n  ()\nend\n").unwrap_err();
+        assert!(err.msg.starts_with("cannot partially apply with an argument of type `String`"), "{}", err.msg);
+        mono_src("def len_plus(s: &String, n: Int) -> Int\n  n\nend\ndef main\n  let s = \"x\"\n  let f = len_plus(&s)\n  let n = f(1)\n  ()\nend\n").unwrap();
     }
 }

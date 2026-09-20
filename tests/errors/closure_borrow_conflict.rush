@@ -1,0 +1,6 @@
+def main
+  let mut total = 0
+  let f = { |x: Int| total += x }
+  puts(int_to_s(total))
+  f(1)
+end

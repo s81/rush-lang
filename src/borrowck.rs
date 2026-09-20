@@ -10,7 +10,7 @@ use std::collections::HashMap;
 
 use crate::diag::{Diagnostic, Span};
 use crate::mir::*;
-use crate::types::{Type, TypeInfo};
+use crate::types::{GlobalKind, Type, TypeInfo};
 
 #[derive(Clone, PartialEq, Debug)]
 struct Bits(Vec<u64>);
@@ -149,8 +149,10 @@ impl<'a> Bc<'a> {
 
     fn operand_loans(&self, holds: &[Bits], op: &Operand) -> Bits {
         match op {
-            Operand::Place(p) => holds[p.local as usize].clone(),
-            Operand::Const(_) => Bits::new(self.n()),
+            // A value read out of a place carries the place's loans only if it can hold one:
+            // an `Int` copied out of a capture environment borrows nothing.
+            Operand::Place(p) if self.info.may_borrow(&place_type(self.info, self.body, p)) => holds[p.local as usize].clone(),
+            _ => Bits::new(self.n()),
         }
     }
 
@@ -174,10 +176,12 @@ impl<'a> Bc<'a> {
                 }
             }
             Rvalue::Call(c, ops) => {
-                if self.info.contains_ref(target_ty) {
+                if self.info.may_borrow(target_ty) {
                     let key_name = match c {
                         Callee::Def { name, .. } | Callee::Extern(name) => name.clone(),
                         Callee::Trait { trait_name, method, .. } => format!("{trait_name}::{method}"),
+                        // No elision for function values: every operand's loans flow in.
+                        Callee::Value => String::new(),
                     };
                     match self.info.elided.get(&key_name) {
                         Some(&i) => {
@@ -198,6 +202,27 @@ impl<'a> Bc<'a> {
             Rvalue::Binary(..) | Rvalue::Unary(..) | Rvalue::Discriminant(_) => {}
         }
         out
+    }
+
+    /// A function value of type `ty` holding `held` loans is passed where it could escape.
+    /// Names a borrowed variable when one is known, preferring named places over temporaries.
+    fn escaping_fn(&self, held: &Bits, ty: &Type, span: Span) -> Diagnostic {
+        let named = |l: &usize| match &self.loans[*l].origin {
+            Origin::Place(p, _) => !self.body.locals[p.local as usize].name.is_empty() || capture_of(self.info, self.body, p).is_some(),
+            _ => true,
+        };
+        let l = held.iter().find(named).or_else(|| held.iter().next()).unwrap();
+        let (who, note) = match &self.loans[l].origin {
+            Origin::Place(p, _) => (self.name(p), Some(self.loans[l].span)),
+            Origin::Entry(param) => (self.name(&Place::local(*param)), None),
+            Origin::Gc(_) => ("a `Gc` value".to_string(), Some(self.loans[l].span)),
+        };
+        let r = Type::r#ref(false, ty.clone());
+        let d = Diagnostic::new(span, format!("function value borrows `{who}` and cannot be passed as an owned function; use `move` or take `{r}`"));
+        match note {
+            Some(sp) => d.with_note(sp, format!("`{who}` is borrowed here")),
+            None => d,
+        }
     }
 
     /// A value carrying `loans` is stored behind the references `r` holds.
@@ -228,13 +253,25 @@ impl<'a> Bc<'a> {
             Statement::Assign(target, rv, span) => {
                 let tty = place_type(self.info, self.body, target);
                 let loans = self.rvalue_loans(holds, key, rv, &tty);
+                // A function value holding loans cannot go where it could be stored or returned.
+                if let Rvalue::Call(c, ops) = rv {
+                    let args = if *c == Callee::Value { &ops[1..] } else { &ops[..] };
+                    for op in args {
+                        let Operand::Place(p) = op else { continue };
+                        let ty = place_type(self.info, self.body, p);
+                        let held = self.operand_loans(holds, op);
+                        if self.info.holds_owned_fn(&ty) && held.iter().next().is_some() {
+                            return Err(self.escaping_fn(&held, &ty, *span));
+                        }
+                    }
+                }
                 // Arguments may be stored behind a `&mut` argument whose pointee holds references.
                 if let Rvalue::Call(_, ops) = rv {
                     for (i, op) in ops.iter().enumerate() {
                         let Operand::Place(p) = op else { continue };
                         let ty = place_type(self.info, self.body, p);
                         if let Some((true, inner)) = ty.as_ref() {
-                            if self.info.contains_ref(inner) {
+                            if self.info.may_borrow(inner) {
                                 let mut others = Bits::new(self.n());
                                 for (j, o) in ops.iter().enumerate() {
                                     if j != i {
@@ -328,6 +365,11 @@ impl<'a> Bc<'a> {
             }
         };
         if access == Access::Kill && self.body.locals[place.local as usize].name.is_empty() {
+            // A borrowing closure's environment lives in the frame that creates it.
+            if matches!(self.body.locals[place.local as usize].ty, Type::Fn(..)) {
+                let d = Diagnostic::new(span, "borrowing closure does not live long enough; use `move` to give it its own environment");
+                return Some(d.with_note(self.loans[l].span, "the closure is borrowed here"));
+            }
             return Some(Diagnostic::new(span, "temporary value dropped while borrowed").with_note(self.loans[l].span, borrowed(lp)));
         }
         let x = self.name(place);
@@ -353,7 +395,8 @@ pub fn check(bodies: &mut [Body], info: &TypeInfo) -> Result<(), Diagnostic> {
 
 fn check_body(body: &mut Body, info: &TypeInfo) -> Result<(), Diagnostic> {
     let n_locals = body.locals.len();
-    let carries: Vec<bool> = body.locals.iter().map(|l| info.contains_ref(&l.ty)).collect();
+    // Function values are tracked too: closures and partial applications can hold loans.
+    let carries: Vec<bool> = body.locals.iter().map(|l| info.may_borrow(&l.ty)).collect();
     let mut bc = Bc { info, body, loans: Vec::new(), created: HashMap::new(), carries };
     for (bi, bb) in body.blocks.iter().enumerate() {
         for (si, s) in bb.stmts.iter().enumerate() {
@@ -370,7 +413,8 @@ fn check_body(body: &mut Body, info: &TypeInfo) -> Result<(), Diagnostic> {
     let mut entry_state: Vec<Bits> = vec![Bits::new(0); n_locals];
     let mut entry_loans: HashMap<LocalId, usize> = HashMap::new();
     for l in 1..=body.n_params {
-        if bc.carries[l] {
+        // An owned function parameter holds no loans: callers cannot pass a borrowing one.
+        if info.contains_ref(&body.locals[l].ty) {
             entry_loans.insert(l as LocalId, bc.loans.len());
             bc.loans.push(Loan { origin: Origin::Entry(l as LocalId), span: Span::default() });
         }
@@ -648,11 +692,16 @@ fn check_return(bc: &Bc, ret_loans: &Bits, bb: &BasicBlock) -> Result<(), Diagno
                 return Err(Diagnostic::new(span.unwrap_or_default(), "cannot return a reference obtained from a `Gc` borrow; its runtime borrow ends here"));
             }
             Origin::Entry(param) if Some(*param) != elided => {
-                let want = match elided {
-                    Some(e) => bc.name(&Place::local(e)),
-                    None => "a parameter".into(),
+                let span = span.unwrap_or_default();
+                if *param == 1 && matches!(bc.info.globals.get(&bc.body.name).map(|g| &g.kind), Some(GlobalKind::Closure { .. })) {
+                    return Err(Diagnostic::new(span, "cannot return a reference to a captured variable"));
+                }
+                let who = bc.name(&Place::local(*param));
+                let msg = match elided {
+                    Some(e) => format!("returned reference must borrow from `{}`", bc.name(&Place::local(e))),
+                    None => format!("cannot return a value that borrows `{who}`; return an owned value instead"),
                 };
-                return Err(Diagnostic::new(span.unwrap_or_default(), format!("returned reference must borrow from `{want}`")));
+                return Err(Diagnostic::new(span, msg));
             }
             _ => {}
         }
@@ -771,5 +820,76 @@ end
         let set = "def set[T](o: &mut Option[T], v: T)\n  *o = Some(v)\nend\n";
         let src = format!("{set}{}", prog("  let mut o = None\n  if true\n    let t = int_to_s(1)\n    set(&mut o, &t)\n  end\n  case o\n  in Some(r) then puts(r)\n  in None then ()\n  end\n"));
         assert_eq!(err(&src), "`t` does not live long enough");
+    }
+
+    const FNS: &str = "def each_to(n: Int, f: &(Int -> Unit))\n  let mut i = 1\n  while i <= n\n    f(i)\n    i += 1\n  end\nend\n\
+                       def keep(f: Int -> Int) -> Int -> Int\n  f\nend\ndef add(a: Int, b: Int) -> Int\n  a + b\nend\n\
+                       def len_plus(s: &String, n: Int) -> Int\n  n\nend\n";
+
+    fn fns(rest: &str) -> String {
+        format!("{FNS}{rest}")
+    }
+
+    #[test]
+    fn accepts_closures_used_within_their_borrows() {
+        // The mutable capture ends at the closure's last use.
+        ok(&fns("def main\n  let mut total = 0\n  let f = { |i: Int| total += i }\n  f(1)\n  f(2)\n  puts(&int_to_s(total))\nend\n"));
+        ok(&fns("def main\n  let mut total = 0\n  let mut k = 0\n  while k < 3\n    each_to(3) { |i| total += i }\n    k += 1\n  end\n  puts(&int_to_s(total))\nend\n"));
+        // Owned function values leave their function.
+        ok(&fns("def adder(k: Int) -> Int -> Int\n  move { |x| x + k }\nend\ndef inc -> Int -> Int\n  add(1)\nend\ndef main\n  let a = adder(1)\n  let b = keep(inc)\n  ()\nend\n"));
+        // A `move` closure nested in another copies `Copy` captures out of the outer
+        // environment, so the inner value borrows nothing and can be returned.
+        ok(&fns("def nested(base: Int) -> Int -> Int -> Int\n  move { |a| move { |b| base + a + b } }\nend\ndef main\n  ()\nend\n"));
+        // A captured `&mut` is reborrowed for the closure's life, then usable again.
+        ok(&fns("def bump(r: &mut Int) -> Int\n  let f = { || *r = *r + 1 }\n  f()\n  f()\n  *r\nend\ndef main\n  let mut x = 1\n  bump(&mut x)\n  ()\nend\n"));
+        assert_eq!(
+            err(&fns("def bump(r: &mut Int) -> Int\n  let f = { || *r = *r + 1 }\n  let v = *r\n  f()\n  v\nend\ndef main\n  ()\nend\n")),
+            "cannot use `*r` because it is mutably borrowed"
+        );
+        // A closure may return a borrow of its one reference parameter.
+        ok(&fns("def main\n  let f = { |s: &String| s }\n  let t = \"a\"\n  puts(f(&t))\nend\n"));
+    }
+
+    #[test]
+    fn rejects_uses_that_conflict_with_a_live_closure() {
+        assert_eq!(
+            err(&fns("def main\n  let mut total = 0\n  let f = { |i: Int| total += i }\n  let x = total\n  f(1)\nend\n")),
+            "cannot use `total` because it is mutably borrowed"
+        );
+    }
+
+    #[test]
+    fn rejects_borrowing_function_values_that_could_escape() {
+        let msg = "function value borrows `total` and cannot be passed as an owned function; use `move` or take `&(Int -> Int)`";
+        assert_eq!(err(&fns("def main\n  let total = 1\n  let f = { |i: Int| i + total }\n  keep(*f)\n  ()\nend\n")), msg);
+        let d = run(&fns("def main\n  let total = 1\n  let f = { |i: Int| i + total }\n  let g = Gc.new(*f)\n  ()\nend\n")).unwrap_err();
+        assert_eq!(d.msg, "function value borrows `total` and cannot be passed as an owned function; use `move` or take `&(Int -> Int)`");
+        assert_eq!(d.notes[0].1, "`total` is borrowed here");
+        // A borrowing closure copied out of its reference cannot be returned either.
+        assert_eq!(
+            err(&fns("def f -> Int -> Int\n  let t = 1\n  let g = { |x: Int| x + t }\n  *g\nend\ndef main\n  ()\nend\n")),
+            "borrowing closure does not live long enough; use `move` to give it its own environment"
+        );
+        // A partial application holding a parameter's borrow.
+        assert_eq!(
+            err(&fns("def f(s: &String) -> Int -> Int\n  len_plus(s)\nend\ndef main\n  ()\nend\n")),
+            "cannot return a value that borrows `s`; return an owned value instead"
+        );
+    }
+
+    #[test]
+    fn closure_bodies_cannot_move_or_return_their_captures() {
+        assert_eq!(
+            err(&fns("def main\n  let s = \"a\"\n  let f = move { || s }\n  ()\nend\n")),
+            "cannot move captured `s` out of a closure; clone it instead"
+        );
+        assert_eq!(
+            err(&fns("def take(s: String)\n  ()\nend\ndef main\n  let s = \"a\"\n  let f = { || take(s) }\n  ()\nend\n")),
+            "cannot move captured `s` out of a closure; clone it instead"
+        );
+        assert_eq!(
+            err(&fns("def main\n  let name = \"a\"\n  let f = { |s: &String| &name }\n  ()\nend\n")),
+            "cannot return a reference to a captured variable"
+        );
     }
 }

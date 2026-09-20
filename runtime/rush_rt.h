@@ -7,6 +7,10 @@
 typedef struct { char _; } rush_unit;
 #define RUSH_UNIT ((rush_unit){0})
 
+/* A function value: a code pointer, followed in memory by its environment. The code takes the
+   value itself first, then the arguments, and is cast to its real type at each call. */
+typedef struct rush_fn { void (*code)(void); } rush_fn;
+
 /* UTF-8 string. cap == 0 means static or borrowed storage that is never freed. */
 typedef struct { uint8_t *ptr; size_t len; size_t cap; } rush_str;
 
@@ -43,6 +47,7 @@ rush_str rush_int_to_s(int64_t v);
 rush_str rush_float_to_s(double v);
 rush_str rush_bool_to_s(bool v);
 rush_str rush_str_concat(const rush_str *a, const rush_str *b);
+rush_str rush_sym_to_s(const char *s);
 rush_unit rush_gc_collect_now(void);
 int64_t rush_gc_live(void);
 

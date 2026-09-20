@@ -1,0 +1,1 @@
+error: function value borrows `base` and cannot be passed as an owned function; use `move` or take `&(Int -> Int)`

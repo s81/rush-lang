@@ -8,6 +8,8 @@ pub enum Tok {
     /// A string containing `#{...}`. Code parts are lexed and parsed by the parser.
     Interp(Vec<RawPart>),
     Ident(String),
+    /// `:name`, a symbol literal.
+    Sym(String),
     Kw(&'static str),
     Op(&'static str),
     Newline,
@@ -28,7 +30,7 @@ pub struct Token {
 }
 
 const KEYWORDS: &[&str] = &[
-    "def", "end", "let", "mut", "if", "elsif", "else", "while", "for", "in", "loop", "break",
+    "def", "do", "end", "let", "mut", "if", "elsif", "else", "while", "for", "in", "loop", "break",
     "next", "return", "case", "then", "struct", "enum", "trait", "impl", "import", "move", "mdo",
     "self", "true", "false", "and", "or", "not", "type", "extern", "Self", "derive",
 ];
@@ -125,6 +127,17 @@ fn skip_code(src: &str, from: usize, str_start: usize) -> Result<usize, Diagnost
     Err(Diagnostic::new(sp(str_start, i), "unterminated interpolation in string"))
 }
 
+/// End of the identifier starting at `i`. `empty?` and `sort!` are identifiers; `x != y` is not.
+fn ident_end(b: &[u8], mut i: usize) -> usize {
+    while i < b.len() && (b[i].is_ascii_alphanumeric() || b[i] == b'_') {
+        i += 1;
+    }
+    if i < b.len() && (b[i] == b'?' || b[i] == b'!') && !(i + 1 < b.len() && b[i + 1] == b'=') {
+        i += 1;
+    }
+    i
+}
+
 pub fn lex(src: &str) -> Result<Vec<Token>, Diagnostic> {
     let b = src.as_bytes();
     let mut i = 0usize;
@@ -190,15 +203,18 @@ pub fn lex(src: &str) -> Result<Vec<Token>, Diagnostic> {
                 i = end;
                 out.push(Token { tok, span: sp(start, i) });
             }
+            // `:name` is a symbol unless the colon follows a name or a closing bracket (`x: Int`, `{ f:v }`).
+            b':' if i + 1 < b.len()
+                && (b[i + 1].is_ascii_alphabetic() || b[i + 1] == b'_')
+                && !(i > 0 && (b[i - 1].is_ascii_alphanumeric() || matches!(b[i - 1], b'_' | b')' | b']' | b'?' | b'!'))) =>
+            {
+                let start = i;
+                i = ident_end(b, i + 1);
+                out.push(Token { tok: Tok::Sym(src[start + 1..i].to_string()), span: sp(start, i) });
+            }
             c if c.is_ascii_alphabetic() || c == b'_' => {
                 let start = i;
-                while i < b.len() && (b[i].is_ascii_alphanumeric() || b[i] == b'_') {
-                    i += 1;
-                }
-                // `empty?` and `sort!` are identifiers; `x != y` is not.
-                if i < b.len() && (b[i] == b'?' || b[i] == b'!') && !(i + 1 < b.len() && b[i + 1] == b'=') {
-                    i += 1;
-                }
+                i = ident_end(b, i);
                 let word = &src[start..i];
                 let tok = match KEYWORDS.iter().find(|k| **k == word) {
                     Some(k) => Tok::Kw(k),
@@ -310,6 +326,14 @@ mod tests {
     #[test]
     fn escaped_hash_is_literal() {
         assert_eq!(toks("\"\\#{x}\""), vec![Tok::Str("#{x}".into()), Tok::Newline, Tok::Eof]);
+    }
+
+    #[test]
+    fn symbols_only_where_a_colon_cannot_be_punctuation() {
+        assert_eq!(toks("f(:ok?)"), vec![Tok::Ident("f".into()), Tok::Op("("), Tok::Sym("ok?".into()), Tok::Op(")"), Tok::Newline, Tok::Eof]);
+        assert_eq!(toks("x = :a_b"), vec![Tok::Ident("x".into()), Tok::Op("="), Tok::Sym("a_b".into()), Tok::Newline, Tok::Eof]);
+        assert_eq!(toks("x: Int"), vec![Tok::Ident("x".into()), Tok::Op(":"), Tok::Ident("Int".into()), Tok::Newline, Tok::Eof]);
+        assert_eq!(toks("{ f:v }"), vec![Tok::Op("{"), Tok::Ident("f".into()), Tok::Op(":"), Tok::Ident("v".into()), Tok::Op("}"), Tok::Newline, Tok::Eof]);
     }
 
     #[test]

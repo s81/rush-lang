@@ -1,0 +1,43 @@
+struct Noisy
+  name: String
+end
+
+impl Drop for Noisy
+  def drop(&mut self)
+    puts("drop #{@name}")
+  end
+end
+
+def call_it(f: &(Unit -> Unit))
+  f()
+end
+
+# The captured `Noisy` moves into the closure's GC environment and outlives this call.
+def make_owner(tag: String) -> Unit -> String
+  let n = Noisy { name: tag }
+  move { || n.name.clone }
+end
+
+def use_owner
+  let f = make_owner("moved")
+  puts(f())
+  puts("end of use_owner")
+end
+
+# `b` is only borrowed by the closure, so it is dropped here, at its own scope end.
+def borrowed_case
+  let b = Noisy { name: "borrowed" }
+  let show = { || puts("see #{b.name}") }
+  call_it(show)
+  call_it(show)
+  puts("end of borrowed_case")
+end
+
+def main
+  borrowed_case
+  puts("---")
+  use_owner
+  puts("before collect")
+  gc_collect_now
+  puts("after collect")
+end

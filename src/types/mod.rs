@@ -84,7 +84,7 @@ impl Type {
         }
     }
     pub fn is_primitive(&self) -> bool {
-        matches!(self.head(), Some("Int" | "Float" | "Bool" | "String" | "Unit"))
+        matches!(self.head(), Some("Int" | "Float" | "Bool" | "String" | "Unit" | "Symbol"))
     }
     pub fn has_var(&self) -> bool {
         match self {
@@ -125,8 +125,13 @@ impl fmt::Display for Type {
         match self {
             Type::Var(v) => write!(f, "?{v}"),
             Type::Param(p) => write!(f, "{p}"),
-            Type::Con(n, args) if n == "&" => write!(f, "&{}", args[0]),
-            Type::Con(n, args) if n == "&mut" => write!(f, "&mut {}", args[0]),
+            Type::Con(n, args) if n == "&" || n == "&mut" => {
+                let m = if n == "&" { "&" } else { "&mut " };
+                match &args[0] {
+                    Type::Fn(..) => write!(f, "{m}({})", args[0]),
+                    a => write!(f, "{m}{a}"),
+                }
+            }
             Type::Con(n, args) if n == "Tuple" => {
                 write!(f, "(")?;
                 for (i, a) in args.iter().enumerate() {
@@ -189,6 +194,76 @@ pub enum GlobalKind {
     Variant { enum_name: String, index: usize },
     ImplMethod { impl_id: usize },
     TraitDefault { trait_name: String },
+    /// A closure body; its scheme vars are the enclosing function's.
+    Closure { parent: String },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum CaptureMode {
+    /// Borrowed `&`.
+    Shared,
+    /// Borrowed `&mut`; the body mutates the variable.
+    Mut,
+    /// A `&mut T` variable, captured as `&mut *r`.
+    Reborrow,
+    /// Copied or moved into a `move` closure's environment.
+    Move,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct Capture {
+    pub name: String,
+    /// The captured variable's type.
+    pub ty: Type,
+    pub mode: CaptureMode,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ClosureInfo {
+    /// `parent#cK`, the name of the closure's body.
+    pub name: String,
+    pub parent: String,
+    pub captures: Vec<Capture>,
+    pub is_move: bool,
+    /// Declared parameters; `[Unit]` for a block without parameters.
+    pub params: Vec<Type>,
+    pub ret: Type,
+    pub span: Span,
+}
+
+impl ClosureInfo {
+    /// Field types of the environment tuple, one per capture.
+    pub fn env_fields(&self) -> Vec<Type> {
+        self.captures
+            .iter()
+            .map(|c| match c.mode {
+                CaptureMode::Shared => Type::r#ref(false, c.ty.clone()),
+                CaptureMode::Mut => Type::r#ref(true, c.ty.clone()),
+                CaptureMode::Reborrow | CaptureMode::Move => c.ty.clone(),
+            })
+            .collect()
+    }
+    /// The closure body's first parameter: `&Tuple[fields]`, or `&Unit` without captures.
+    pub fn env_type(&self) -> Type {
+        Type::r#ref(false, Type::tuple(self.env_fields()))
+    }
+    /// Type of the closure literal: owned, or `&(..)` when it borrows what it captures.
+    pub fn ty(&self) -> Type {
+        let f = Type::func(&self.params, self.ret.clone());
+        if !self.is_move && !self.captures.is_empty() {
+            Type::r#ref(false, f)
+        } else {
+            f
+        }
+    }
+}
+
+/// Number of top-level arrows of a function type (0 for anything else).
+pub fn arity(t: &Type) -> usize {
+    match t {
+        Type::Fn(_, r) => 1 + arity(r),
+        _ => 0,
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -269,6 +344,8 @@ pub enum DotRes {
     Method(MethodRes),
     /// `Type.function(args)`; the receiver expression is not evaluated.
     Assoc { global: String, targs: Vec<Type> },
+    /// `Type.method`: a method named through its type, a function taking the receiver first.
+    MethodValue(MethodRes),
 }
 
 #[derive(Debug, Default)]
@@ -300,6 +377,8 @@ pub struct TypeInfo {
     /// Function or trait method (`Trait::method`) -> index of the parameter its returned
     /// references borrow from (elision). Absent when the declared result holds no reference.
     pub elided: HashMap<String, usize>,
+    /// Closure literals.
+    pub closures: HashMap<ExprId, ClosureInfo>,
 }
 
 /// One-way match of a pattern type (impl generics as `Param`s) against a ground type.
@@ -340,7 +419,7 @@ impl TypeInfo {
             Type::Param(p) => param_copy(p),
             Type::Fn(..) => true,
             Type::Con(n, args) => match n.as_str() {
-                "Int" | "Float" | "Bool" | "Unit" | "&" | "Gc" => true,
+                "Int" | "Float" | "Bool" | "Unit" | "Symbol" | "&" | "Gc" => true,
                 "String" | "&mut" => false,
                 "Tuple" => args.iter().all(|a| self.is_copy(a, param_copy)),
                 _ => match self.impl_for("Copy", t) {
@@ -353,15 +432,37 @@ impl TypeInfo {
 
     /// Whether a value of `t` may hold a reference (and so carries loans).
     pub fn contains_ref(&self, t: &Type) -> bool {
-        self.contains_ref_in(t, &mut Vec::new())
+        self.contains_in(t, &|t| matches!(t, Type::Con(n, _) if n == "&" || n == "&mut"), true, &mut Vec::new())
     }
 
-    fn contains_ref_in(&self, t: &Type, visiting: &mut Vec<Type>) -> bool {
-        let Type::Con(n, args) = t else { return false };
-        if n == "&" || n == "&mut" {
+    /// Whether `t` holds a function value anywhere, including behind references.
+    pub fn contains_fn(&self, t: &Type) -> bool {
+        self.contains_in(t, &|t| matches!(t, Type::Fn(..)), true, &mut Vec::new())
+    }
+
+    /// Whether `t` holds a function value that is not behind a reference: a value of `t`
+    /// may be stored or returned by whoever receives it.
+    pub fn holds_owned_fn(&self, t: &Type) -> bool {
+        self.contains_in(t, &|t| matches!(t, Type::Fn(..)), false, &mut Vec::new())
+    }
+
+    /// Whether values of `t` may carry loans: references, or function values (closures and
+    /// partial applications can hold borrows).
+    pub fn may_borrow(&self, t: &Type) -> bool {
+        self.contains_ref(t) || self.contains_fn(t)
+    }
+
+    /// Whether `t` or a component of it (fields and variants, after substitution) is a `leaf`.
+    /// `through_refs` also looks behind `&` and `&mut`.
+    fn contains_in(&self, t: &Type, leaf: &dyn Fn(&Type) -> bool, through_refs: bool, visiting: &mut Vec<Type>) -> bool {
+        if leaf(t) {
             return true;
         }
-        if args.iter().any(|a| self.contains_ref_in(a, visiting)) {
+        let Type::Con(n, args) = t else { return false };
+        if !through_refs && (n == "&" || n == "&mut") {
+            return false;
+        }
+        if args.iter().any(|a| self.contains_in(a, leaf, through_refs, visiting)) {
             return true;
         }
         if visiting.contains(t) {
@@ -377,7 +478,7 @@ impl TypeInfo {
         } else {
             vec![]
         };
-        let r = fields.iter().any(|f| self.contains_ref_in(f, visiting));
+        let r = fields.iter().any(|f| self.contains_in(f, leaf, through_refs, visiting));
         visiting.pop();
         r
     }
@@ -403,7 +504,7 @@ impl TypeInfo {
         match t {
             Type::Con(n, args) => match n.as_str() {
                 "String" => true,
-                "Int" | "Float" | "Bool" | "Unit" | "&" | "&mut" | "Gc" => false,
+                "Int" | "Float" | "Bool" | "Unit" | "Symbol" | "&" | "&mut" | "Gc" => false,
                 "Tuple" => args.iter().any(|a| self.needs_drop(a)),
                 _ => {
                     if self.impl_for("Drop", t).is_some() {
@@ -450,7 +551,7 @@ pub struct TypeEnv<'a> {
     pub self_ty: Option<&'a Type>,
 }
 
-const BUILTIN_TYPES: &[&str] = &["Int", "Float", "Bool", "String", "Unit"];
+pub const BUILTIN_TYPES: &[&str] = &["Int", "Float", "Bool", "String", "Unit", "Symbol"];
 
 pub fn from_ast(t: &TypeExpr, env: &TypeEnv) -> Result<Type, Diagnostic> {
     match t {

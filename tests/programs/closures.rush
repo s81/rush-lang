@@ -1,0 +1,51 @@
+enum Shape
+  Circle(Float)
+  Rect(Float, Float)
+end
+
+impl Shape
+  def area(&self) -> Float
+    case self
+    in Circle(r) then 3.0 * r * r
+    in Rect(w, h) then w * h
+    end
+  end
+end
+
+def each_to(n: Int, f: &(Int -> Unit))
+  for i in 1..n
+    f(i)
+  end
+end
+
+def adder(k: Int) -> Int -> Int
+  move { |x| x + k }
+end
+
+def twice(f: &(Int -> Int), x: Int) -> Int
+  f(f(x))
+end
+
+def add(a: Int, b: Int) -> Int
+  a + b
+end
+
+def main
+  let mut total = 0
+  each_to(3) { |i| total += i }          # borrows total mutably for the call
+  puts(int_to_s(total))                  # 6
+  let inc = add(1)                       # partial application: Int -> Int
+  puts(int_to_s(twice(&inc, 5)))         # 7
+  puts(int_to_s(5 |> adder(10)))         # 15
+  let area = Shape.area                  # &Shape -> Float
+  puts(float_to_s(area(&Rect(2.0, 3.0))))
+  let wrap = Some                        # Int -> Option[Int]
+  puts("#{wrap(1)}")                     # Some(1)
+  let found = loop
+    total += 1
+    if total > 8
+      break total
+    end
+  end
+  puts("#{found} #{:done} #{:done.inspect}")
+end

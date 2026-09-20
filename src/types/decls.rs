@@ -60,7 +60,7 @@ impl<'a> Checker<'a> {
                 Item::Enum(e) => (&e.name, &e.generics, e.span),
                 _ => continue,
             };
-            if self.adts.contains_key(name) || ["Int", "Float", "Bool", "String", "Unit", "Tuple"].contains(&name.as_str()) {
+            if self.adts.contains_key(name) || name == "Tuple" || super::BUILTIN_TYPES.contains(&name.as_str()) {
                 return Err(Diagnostic::new(span, format!("duplicate type `{name}`")));
             }
             self.adts.insert(name.clone(), generics.params.len());

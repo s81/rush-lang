@@ -1,0 +1,73 @@
+struct Point
+  derive Show
+  x: Int
+  y: Int
+end
+
+impl Point
+  def new(x: Int, y: Int) -> Point
+    Point { x: x, y: y }
+  end
+
+  def shifted(&self, dx: Int, dy: Int) -> Point
+    Point { x: @x + dx, y: @y + dy }
+  end
+end
+
+enum Tagged
+  derive Show
+  Pair(Int, Int)
+  One(Int)
+end
+
+def add3(a: Int, b: Int, c: Int) -> Int
+  a + b + c
+end
+
+def double(n: Int) -> Int
+  n * 2
+end
+
+def apply[T, R](f: &(T -> R), x: T) -> R
+  f(x)
+end
+
+def nested(base: Int) -> Int -> Int -> Int
+  move { |a| move { |b| base + a + b } }
+end
+
+def main
+  let f = add3                           # Int -> Int -> Int -> Int
+  puts(int_to_s(f(1, 2, 3)))             # 6
+  let g = add3(1)                        # partial: Int -> Int -> Int
+  puts(int_to_s(g(2, 3)))                # 6
+  puts(int_to_s(add3(1, 2)(3)))          # over-application: 6
+
+  let mk = Pair                          # Int -> Int -> Tagged
+  let one = One
+  puts("#{mk(1, 2)} #{one(3)}")          # Pair(1, 2) One(3)
+  let mk1 = Pair(1)                      # partial constructor
+  puts("#{mk1(9)}")                      # Pair(1, 9)
+
+  let np = Point.new                     # Int -> Int -> Point
+  puts("#{np(1, 2)}")                    # Point { x: 1, y: 2 }
+  let along = Point.new(5)               # partial associated function
+  puts("#{along(6)}")                    # Point { x: 5, y: 6 }
+
+  let sh = Point.shifted                 # &Point -> Int -> Int -> Point
+  let p = Point { x: 1, y: 1 }
+  puts("#{sh(&p, 2, 3)}")                # Point { x: 3, y: 4 }
+  puts("#{2 |> sh(&p, 10)}")             # Point { x: 11, y: 3 }
+
+  puts(int_to_s(3 |> double))            # 6
+  puts(int_to_s(3 |> double |> double))  # 12
+  puts(int_to_s(3 |> add3(1, 2)))        # 6
+
+  puts(int_to_s(apply(&double, 5)))      # 10
+  let k = 10
+  puts(int_to_s(apply({ |x: Int| x + k }, 5)))   # 15
+
+  let n = nested(10)
+  puts(int_to_s(n(3, 4)))                # 17: closure returning a closure, two arguments at once
+  puts(int_to_s(nested(100)(3, 4)))      # 107
+end

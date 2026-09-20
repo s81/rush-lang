@@ -1,0 +1,10 @@
+see borrowed
+see borrowed
+end of borrowed_case
+drop borrowed
+---
+moved
+end of use_owner
+before collect
+drop moved
+after collect

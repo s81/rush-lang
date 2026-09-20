@@ -1,0 +1,8 @@
+def make(k: Int) -> Int -> Int
+  { |x| x + k }
+end
+
+def main
+  let f = make(1)
+  puts(int_to_s(f(2)))
+end

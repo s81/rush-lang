@@ -106,10 +106,18 @@ impl<'a> Ck<'a> {
             self.move_spans.insert(p.local, span);
             return Ok(());
         }
-        if p.proj.contains(&Proj::Deref) {
-            return Err(Diagnostic::new(span, "cannot move out of a reference; use `.clone`"));
+        Err(self.move_out_error(p, span))
+    }
+
+    /// Why the non-`Copy` value at projected place `p` cannot be moved.
+    fn move_out_error(&self, p: &Place, span: Span) -> Diagnostic {
+        if let Some((name, _)) = capture_of(self.info, self.body, p) {
+            return Diagnostic::new(span, format!("cannot move captured `{name}` out of a closure; clone it instead"));
         }
-        Err(Diagnostic::new(span, format!("cannot move out of `{}`; use `.clone`", describe_place(self.info, self.body, p))))
+        if p.proj.contains(&Proj::Deref) {
+            return Diagnostic::new(span, "cannot move out of a reference; use `.clone`");
+        }
+        Diagnostic::new(span, format!("cannot move out of `{}`; use `.clone`", describe_place(self.info, self.body, p)))
     }
 
     fn read_operand(&self, st: &State, op: &Operand, span: Span) -> Result<(), Diagnostic> {
@@ -137,7 +145,7 @@ impl<'a> Ck<'a> {
                         let ty = place_type(self.info, self.body, p);
                         if !self.is_copy(&ty) {
                             if p.proj.contains(&Proj::Deref) {
-                                return Err(Diagnostic::new(*span, "cannot move out of a reference; use `.clone`"));
+                                return Err(self.move_out_error(p, *span));
                             }
                             let l = p.local as usize;
                             if self.tracked[l] {

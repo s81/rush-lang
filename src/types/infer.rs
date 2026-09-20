@@ -99,6 +99,15 @@ pub(super) struct Checker<'a> {
     pub param_bounds: HashMap<String, Vec<String>>,
     pub self_ty: Option<Type>,
     pub ret_ty: Type,
+    /// Enclosing loops, innermost last: `Some(value type)` for `loop`, `None` for `while`/`for`.
+    pub loops: Vec<Option<Type>>,
+    /// Enclosing closure literals, innermost last.
+    frames: Vec<Frame>,
+    /// The global whose body is being checked, and how many closures it has so far.
+    cur_global: String,
+    closure_count: usize,
+    /// Expected type of the closure literal about to be checked (an argument's parameter type).
+    closure_hint: Option<Type>,
     pub pending: Vec<(Type, String, Span)>,
     // Generalization bookkeeping.
     pub gen_map: HashMap<u32, String>,
@@ -121,6 +130,11 @@ pub(super) fn check_program(prog: &Program) -> Result<TypeInfo, Diagnostic> {
         param_bounds: HashMap::new(),
         self_ty: None,
         ret_ty: Type::unit(),
+        loops: vec![],
+        frames: vec![],
+        cur_global: String::new(),
+        closure_count: 0,
+        closure_hint: None,
         pending: vec![],
         gen_map: HashMap::new(),
         next_param: 0,
@@ -151,12 +165,22 @@ fn lit_type(l: &Lit) -> Type {
         Lit::Int(_) => Type::con("Int"),
         Lit::Float(_) => Type::con("Float"),
         Lit::Str(_) => Type::con("String"),
+        Lit::Symbol(_) => Type::con("Symbol"),
         Lit::Bool(_) => Type::con("Bool"),
         Lit::Unit => Type::unit(),
     }
 }
 
 /// Source-level name of a place expression for messages, if it is a simple variable.
+/// A closure literal being checked.
+struct Frame {
+    /// `scopes.len()` outside the closure: bindings in scopes below this are captured.
+    base: usize,
+    is_move: bool,
+    /// Captured name, its type, and whether the body mutates it; in order of first use.
+    captures: Vec<(String, Type, bool)>,
+}
+
 fn var_name(e: &Expr) -> Option<&str> {
     match &e.kind {
         ExprKind::Var(n) => Some(n),
@@ -178,6 +202,47 @@ impl<'a> Checker<'a> {
             }
         }
         None
+    }
+
+    /// Scope index of the binding `name` refers to.
+    fn scope_of(&self, name: &str) -> Option<usize> {
+        self.scopes.iter().rposition(|s| s.contains_key(name))
+    }
+
+    /// Frames (closures) between the use of `name` and its binding.
+    fn crossing(&self, name: &str) -> std::ops::Range<usize> {
+        let Some(i) = self.scope_of(name) else { return 0..0 };
+        let first = self.frames.iter().position(|f| f.base > i).unwrap_or(self.frames.len());
+        first..self.frames.len()
+    }
+
+    /// A use of local `name`: every closure between the use and the binding captures it.
+    fn note_use(&mut self, name: &str) {
+        for k in self.crossing(name) {
+            if !self.frames[k].captures.iter().any(|c| c.0 == name) {
+                let ty = self.lookup(name).unwrap().0;
+                self.frames[k].captures.push((name.to_string(), ty, false));
+            }
+        }
+    }
+
+    /// A mutation of local `name` itself (not through a reference it holds). Captured variables
+    /// are read-only in `move` closures; elsewhere the capture becomes `&mut`.
+    fn note_mutation(&mut self, name: &str, span: Span, what: &str) -> Result<(), Diagnostic> {
+        let range = self.crossing(name);
+        if self.frames[range.clone()].iter().any(|f| f.is_move) {
+            let msg = match what {
+                "assign" => format!("cannot assign to captured `{name}` in a move closure"),
+                _ => format!("cannot {what} captured `{name}` as mutable in a move closure"),
+            };
+            return Err(Diagnostic::new(span, msg));
+        }
+        for k in range {
+            if let Some(c) = self.frames[k].captures.iter_mut().find(|c| c.0 == name) {
+                c.2 = true;
+            }
+        }
+        Ok(())
     }
 
     fn record(&mut self, e: &Expr, t: Type) -> Type {
@@ -237,11 +302,15 @@ impl<'a> Checker<'a> {
 
     /// Errors unless the place rooted at `e` may be mutated (its root is `let mut`, or it is
     /// reached through a `&mut` reference or is a temporary).
-    fn require_mutable(&self, e: &Expr, what: &str) -> Result<(), Diagnostic> {
+    fn require_mutable(&mut self, e: &Expr, what: &str) -> Result<(), Diagnostic> {
         match &e.kind {
             ExprKind::Var(n) => match self.lookup(n) {
                 Some((t, mutable)) => {
-                    if mutable || matches!(self.inf.resolve(&t).as_ref(), Some((true, _))) {
+                    let through_ref = matches!(self.inf.resolve(&t).as_ref(), Some((true, _)));
+                    if !through_ref {
+                        self.note_mutation(n, e.span, what)?;
+                    }
+                    if mutable || through_ref {
                         Ok(())
                     } else {
                         Err(Diagnostic::new(e.span, format!("cannot {what} `{n}` as mutable; it is not declared `mut`")))
@@ -306,6 +375,13 @@ impl<'a> Checker<'a> {
     fn adapt_arg(&mut self, arg: &Expr, found: &Type, param: &Type) -> Result<Type, Diagnostic> {
         let p = self.inf.resolve(param);
         let f = self.inf.resolve(found);
+        if let (ExprKind::Closure { is_move: false, .. }, Type::Fn(..), Some(_)) = (&arg.kind, &p, f.as_ref()) {
+            let name = self.info.closures[&arg.id].captures[0].name.clone();
+            return Err(Diagnostic::new(
+                arg.span,
+                format!("function value borrows `{name}` and cannot be passed as an owned function; use `move` or take `&({p})`"),
+            ));
+        }
         if let Some((m, _)) = p.as_ref() {
             if f.as_ref().is_none() && !matches!(f, Type::Var(_)) {
                 if self.is_place_expr(arg) {
@@ -503,6 +579,9 @@ impl<'a> Checker<'a> {
             scope.insert(p.name.clone(), (t, false));
         }
         self.scopes = vec![scope];
+        self.loops.clear();
+        self.cur_global = job.global.clone();
+        self.closure_count = 0;
         self.ret_ty = ret.clone();
         let body_ty = self.block(&job.def.body)?;
         let body_ty = match job.def.body.stmts.last() {
@@ -602,6 +681,12 @@ impl<'a> Checker<'a> {
                     DotRes::Method(MethodRes::Trait { trait_name: trait_name.clone(), method: method.clone(), self_ty: resolve(&self, self_ty) })
                 }
                 DotRes::Assoc { global, targs } => DotRes::Assoc { global: global.clone(), targs: targs.iter().map(|t| resolve(&self, t)).collect() },
+                DotRes::MethodValue(MethodRes::Direct { global, targs }) => {
+                    DotRes::MethodValue(MethodRes::Direct { global: global.clone(), targs: targs.iter().map(|t| resolve(&self, t)).collect() })
+                }
+                DotRes::MethodValue(MethodRes::Trait { trait_name, method, self_ty }) => {
+                    DotRes::MethodValue(MethodRes::Trait { trait_name: trait_name.clone(), method: method.clone(), self_ty: resolve(&self, self_ty) })
+                }
             };
             dots.insert(*id, d);
         }
@@ -609,6 +694,32 @@ impl<'a> Checker<'a> {
         for g in self.info.globals.values_mut() {
             g.scheme.ty = self.inf.resolve(&g.scheme.ty);
         }
+        // Closure bodies become globals with their parent's type parameters.
+        let mut closures = std::mem::take(&mut self.info.closures);
+        for c in closures.values_mut() {
+            let r = |t: &Type| default_vars(&resolve(&self, t));
+            c.params = c.params.iter().map(r).collect();
+            c.ret = r(&c.ret);
+            for cap in &mut c.captures {
+                cap.ty = r(&cap.ty);
+            }
+        }
+        for c in closures.values() {
+            let parent = &self.info.globals[&c.parent].scheme;
+            let mut params = vec![c.env_type()];
+            params.extend(c.params.iter().cloned());
+            let scheme = Scheme { vars: parent.vars.clone(), bounds: parent.bounds.clone(), ty: Type::func(&params, c.ret.clone()) };
+            let g = Global { scheme, n_params: params.len(), kind: GlobalKind::Closure { parent: c.parent.clone() } };
+            self.info.globals.insert(c.name.clone(), g);
+            match self.info.elide(&c.params, false, &c.ret) {
+                Ok(Some(i)) => {
+                    self.info.elided.insert(c.name.clone(), i + 1);
+                }
+                Ok(None) => {}
+                Err(()) => return Err(Diagnostic::new(c.span, "cannot infer the lifetime of the returned reference; return an owned value instead")),
+            }
+        }
+        self.info.closures = closures;
         // By-value bindings of non-Copy values move out of the scrutinee.
         for r in std::mem::take(&mut self.bind_records) {
             let t = self.info.pat_types[&r.pat].clone();
@@ -700,6 +811,11 @@ impl<'a> Checker<'a> {
     /// Applies curried `ft` to `args` as in Plan 1. `what` names the callee for errors.
     fn apply(&mut self, mut ft: Type, args: &[Expr], what: &str, span: Span, skip: usize) -> Result<Type, Diagnostic> {
         for (i, arg) in args.iter().enumerate() {
+            if matches!(arg.kind, ExprKind::Closure { .. }) {
+                if let Type::Fn(p, _) = self.inf.resolve(&ft) {
+                    self.closure_hint = Some(*p);
+                }
+            }
             let at = self.expr(arg)?;
             match self.inf.resolve(&ft) {
                 Type::Fn(p, r) => {
@@ -742,10 +858,20 @@ impl<'a> Checker<'a> {
             ExprKind::Int(_) => Type::con("Int"),
             ExprKind::Float(_) => Type::con("Float"),
             ExprKind::Str(_) => Type::con("String"),
+            ExprKind::Symbol(_) => Type::con("Symbol"),
+            ExprKind::Range(a, b, _) => {
+                let ta = self.expr(a)?;
+                let tb = self.expr(b)?;
+                self.inf.unify(&ta, &tb, b.span)?;
+                Type::Con("Range".into(), vec![ta])
+            }
             ExprKind::Bool(_) => Type::con("Bool"),
             ExprKind::Unit => Type::unit(),
             ExprKind::Var(n) => match self.lookup(n) {
-                Some((t, _)) => t,
+                Some((t, _)) => {
+                    self.note_use(n);
+                    t
+                }
                 None => self.global_var(e, n)?,
             },
             ExprKind::Tuple(items) => {
@@ -853,8 +979,21 @@ impl<'a> Checker<'a> {
                     ExprKind::Var(n) => n.clone(),
                     _ => "expression".to_string(),
                 };
-                self.apply(ft, args, &what, e.span, 0)?
+                // A borrowed function value is called through its reference.
+                let ft = match self.inf.resolve(&ft).as_ref() {
+                    Some((_, inner)) if matches!(self.inf.resolve(inner), Type::Fn(..)) => inner.clone(),
+                    _ => ft,
+                };
+                // `f()` on a function value passes `()`.
+                match (args.is_empty(), self.inf.resolve(&ft)) {
+                    (true, Type::Fn(p, r)) => {
+                        self.inf.unify(&p, &Type::unit(), e.span)?;
+                        *r
+                    }
+                    _ => self.apply(ft, args, &what, e.span, 0)?,
+                }
             }
+            ExprKind::Closure { params, body, is_move } => self.closure(e, params, body, *is_move)?,
             ExprKind::If { cond, then, els } => {
                 let ct = self.expr(cond)?;
                 let ct = self.value_of(cond, &ct);
@@ -875,8 +1014,56 @@ impl<'a> Checker<'a> {
                 let ct = self.expr(cond)?;
                 let ct = self.value_of(cond, &ct);
                 self.inf.unify(&Type::con("Bool"), &ct, cond.span)?;
+                self.loops.push(None);
                 self.block(body)?;
+                self.loops.pop();
                 Type::unit()
+            }
+            ExprKind::Loop(body) => {
+                // A `loop` without `break` leaves its type unconstrained; it defaults to Unit.
+                let t = self.inf.fresh();
+                self.loops.push(Some(t.clone()));
+                self.block(body)?;
+                self.loops.pop();
+                t
+            }
+            ExprKind::For { var, iter, body, .. } => {
+                let it = self.expr(iter)?;
+                let range_int = Type::Con("Range".into(), vec![Type::con("Int")]);
+                if self.inf.unify(&range_int, &it, iter.span).is_err() {
+                    return Err(Diagnostic::new(iter.span, "`for` needs a `Range[Int]` in this version"));
+                }
+                let mut scope = HashMap::new();
+                if var != "_" {
+                    scope.insert(var.clone(), (Type::con("Int"), false));
+                }
+                self.scopes.push(scope);
+                self.loops.push(None);
+                self.block(body)?;
+                self.loops.pop();
+                self.scopes.pop();
+                Type::unit()
+            }
+            ExprKind::Break(v) => {
+                let Some(target) = self.loops.last().cloned() else {
+                    return Err(Diagnostic::new(e.span, "`break` outside of a loop"));
+                };
+                match (target, v) {
+                    (Some(t), Some(x)) => {
+                        let vt = self.expr(x)?;
+                        self.inf.unify(&t, &vt, x.span)?;
+                    }
+                    (Some(t), None) => self.inf.unify(&t, &Type::unit(), e.span)?,
+                    (None, Some(x)) => return Err(Diagnostic::new(x.span, "`break` with a value is only allowed in `loop`")),
+                    (None, None) => {}
+                }
+                self.inf.fresh()
+            }
+            ExprKind::Next => {
+                if self.loops.is_empty() {
+                    return Err(Diagnostic::new(e.span, "`next` outside of a loop"));
+                }
+                self.inf.fresh()
             }
             ExprKind::Case { scrutinee, arms } => {
                 let st = self.expr(scrutinee)?;
@@ -951,6 +1138,10 @@ impl<'a> Checker<'a> {
                     None => return Err(Diagnostic::new(lhs.span, format!("unknown variable `{name}`"))),
                 };
                 let via_mut_ref = through_field && matches!(self.inf.resolve(&lt).as_ref(), Some((true, _)));
+                self.note_use(name);
+                if !via_mut_ref {
+                    self.note_mutation(name, lhs.span, "assign")?;
+                }
                 if !mutable && !via_mut_ref {
                     return Err(Diagnostic::new(lhs.span, format!("cannot assign twice to immutable variable `{name}`")));
                 }
@@ -1081,13 +1272,108 @@ impl<'a> Checker<'a> {
         }
     }
 
+    /// `Type.method`: an inherent or trait method of `Type` as a function taking the receiver.
+    fn method_value(&mut self, e: &Expr, tn: &str, name: &str, args: Option<&[Expr]>) -> Result<Type, Diagnostic> {
+        let inherent = self.info.impls.iter().find(|i| i.trait_name.is_none() && i.self_ty.head() == Some(tn) && i.methods.contains_key(name)).map(|i| i.methods[name].clone());
+        if let Some(global) = inherent {
+            let g = self.info.globals[&global].clone();
+            let (ft, fresh) = self.instantiate(&g.scheme, HashMap::new(), e.span);
+            self.info.dots.insert(e.id, DotRes::MethodValue(MethodRes::Direct { global, targs: fresh }));
+            self.inst_spans.insert(e.id, e.span);
+            return self.apply(ft, args.unwrap_or(&[]), name, e.span, 0);
+        }
+        let mut trait_names: Vec<String> = self.info.traits.keys().cloned().collect();
+        trait_names.sort();
+        let tn_owned = tn.to_string();
+        let found = trait_names.into_iter().find(|t| {
+            self.info.traits[t].methods.contains_key(name)
+                && self.info.impls.iter().any(|i| i.trait_name.as_deref() == Some(t.as_str()) && (matches!(i.self_ty, Type::Param(_)) || i.self_ty.head() == Some(tn_owned.as_str())))
+        });
+        let Some(trait_name) = found else {
+            return Err(Diagnostic::new(e.span, format!("no associated function `{name}` on `{tn}`")));
+        };
+        let n_generics = self.adts.get(tn).copied().unwrap_or(0);
+        let self_ty = Type::Con(tn.to_string(), (0..n_generics).map(|_| self.inf.fresh()).collect());
+        let sig = self.info.traits[&trait_name].methods[name].clone();
+        let mut fixed = HashMap::new();
+        fixed.insert("Self".to_string(), self_ty.clone());
+        let (ft, _) = self.instantiate(&sig.scheme, fixed, e.span);
+        self.info.dots.insert(e.id, DotRes::MethodValue(MethodRes::Trait { trait_name, method: name.to_string(), self_ty }));
+        self.apply(ft, args.unwrap_or(&[]), name, e.span, 0)
+    }
+
+    /// A closure literal: its parameters, body, captures, and type.
+    fn closure(&mut self, e: &Expr, params: &[ClosureParam], body: &Block, is_move: bool) -> Result<Type, Diagnostic> {
+        let hint = self.closure_hint.take();
+        let mut pts = Vec::new();
+        let mut scope = HashMap::new();
+        for p in params {
+            let t = match &p.ty {
+                Some(te) => from_ast(te, &self.env())?,
+                None => self.inf.fresh(),
+            };
+            scope.insert(p.name.clone(), (t.clone(), false));
+            pts.push(t);
+        }
+        if pts.is_empty() {
+            pts.push(Type::unit());
+        }
+        let ret = self.inf.fresh();
+        // Parameter types come from the expected function type when there is one.
+        if let Some(h) = hint {
+            let h = self.inf.resolve(&h);
+            let h = h.as_ref().map(|(_, inner)| inner.clone()).unwrap_or(h);
+            if matches!(h, Type::Fn(..)) {
+                let _ = self.inf.unify(&h, &Type::func(&pts, ret.clone()), e.span);
+            }
+        }
+        self.frames.push(Frame { base: self.scopes.len(), is_move, captures: vec![] });
+        self.scopes.push(scope);
+        let saved_ret = std::mem::replace(&mut self.ret_ty, ret.clone());
+        let saved_loops = std::mem::take(&mut self.loops);
+        let checked = self.block(body).and_then(|bt| {
+            let bt = match body.stmts.last() {
+                Some(Stmt::Expr(x)) => self.coerce(x, &bt, &ret)?,
+                _ => bt,
+            };
+            self.inf.unify(&ret, &bt, last_span(body, body.span))
+        });
+        self.ret_ty = saved_ret;
+        self.loops = saved_loops;
+        self.scopes.pop();
+        let frame = self.frames.pop().unwrap();
+        checked?;
+        let captures = frame
+            .captures
+            .into_iter()
+            .map(|(name, ty, mutated)| {
+                let mode = if is_move {
+                    CaptureMode::Move
+                } else if matches!(self.inf.resolve(&ty).as_ref(), Some((true, _))) {
+                    CaptureMode::Reborrow
+                } else if mutated {
+                    CaptureMode::Mut
+                } else {
+                    CaptureMode::Shared
+                };
+                Capture { name, ty, mode }
+            })
+            .collect();
+        let name = format!("{}#c{}", self.cur_global, self.closure_count);
+        self.closure_count += 1;
+        let info = ClosureInfo { name, parent: self.cur_global.clone(), captures, is_move, params: pts, ret, span: e.span };
+        let t = info.ty();
+        self.info.closures.insert(e.id, info);
+        Ok(t)
+    }
+
     fn dot(&mut self, e: &Expr, recv: &Expr, name: &str, args: Option<&[Expr]>) -> Result<Type, Diagnostic> {
         // `Type.function(args)`.
         if let ExprKind::Var(tn) = &recv.kind {
-            if self.lookup(tn).is_none() && !self.info.globals.contains_key(tn) && self.adts.contains_key(tn) {
+            if self.lookup(tn).is_none() && !self.info.globals.contains_key(tn) && (self.adts.contains_key(tn) || BUILTIN_TYPES.contains(&tn.as_str())) {
                 let hit = self.info.impls.iter().find(|i| i.trait_name.is_none() && i.self_ty.head() == Some(tn) && i.assoc.contains_key(name)).map(|i| i.assoc[name].clone());
                 let Some(global) = hit else {
-                    return Err(Diagnostic::new(e.span, format!("no associated function `{name}` on `{tn}`")));
+                    return self.method_value(e, tn, name, args);
                 };
                 let g = self.info.globals[&global].clone();
                 let (ft, fresh) = self.instantiate(&g.scheme, HashMap::new(), e.span);
@@ -1362,7 +1648,7 @@ fn collect_refs(e: &Expr, out: &mut Vec<String>) {
             args.iter().flatten().for_each(|a| collect_refs(a, out));
         }
         ExprKind::TupleIndex(r, _) | ExprKind::Ref(_, r) | ExprKind::Deref(r) | ExprKind::Unary(_, r) => collect_refs(r, out),
-        ExprKind::Binary(_, a, b) | ExprKind::Assign(a, b) => {
+        ExprKind::Binary(_, a, b) | ExprKind::Assign(a, b) | ExprKind::Range(a, b, _) => {
             collect_refs(a, out);
             collect_refs(b, out);
         }
@@ -1381,6 +1667,12 @@ fn collect_refs(e: &Expr, out: &mut Vec<String>) {
             collect_refs(cond, out);
             collect_refs_block(body, out);
         }
+        ExprKind::Loop(body) | ExprKind::Closure { body, .. } => collect_refs_block(body, out),
+        ExprKind::For { iter, body, .. } => {
+            collect_refs(iter, out);
+            collect_refs_block(body, out);
+        }
+        ExprKind::Break(v) => v.iter().for_each(|x| collect_refs(x, out)),
         ExprKind::Case { scrutinee, arms } => {
             collect_refs(scrutinee, out);
             for a in arms {
@@ -1428,7 +1720,7 @@ fn collect_cases<'a>(e: &'a Expr, out: &mut Vec<(&'a Expr, &'a [Arm], Span)>) {
             args.iter().flatten().for_each(|a| collect_cases(a, out));
         }
         ExprKind::TupleIndex(r, _) | ExprKind::Ref(_, r) | ExprKind::Deref(r) | ExprKind::Unary(_, r) => collect_cases(r, out),
-        ExprKind::Binary(_, a, b) | ExprKind::Assign(a, b) => {
+        ExprKind::Binary(_, a, b) | ExprKind::Assign(a, b) | ExprKind::Range(a, b, _) => {
             collect_cases(a, out);
             collect_cases(b, out);
         }
@@ -1447,6 +1739,12 @@ fn collect_cases<'a>(e: &'a Expr, out: &mut Vec<(&'a Expr, &'a [Arm], Span)>) {
             collect_cases(cond, out);
             collect_cases_block(body, out);
         }
+        ExprKind::Loop(body) | ExprKind::Closure { body, .. } => collect_cases_block(body, out),
+        ExprKind::For { iter, body, .. } => {
+            collect_cases(iter, out);
+            collect_cases_block(body, out);
+        }
+        ExprKind::Break(v) => v.iter().for_each(|x| collect_cases(x, out)),
         ExprKind::Interp(parts) => parts.iter().for_each(|p| {
             if let InterpPart::Expr(x) = p {
                 collect_cases(x, out)
@@ -1771,5 +2069,180 @@ mod tests {
     fn derived_impls_typecheck() {
         let src = format!("{PERSON}enum S\n  derive Show, Eq, Clone\n  C(Float)\n  R {{ w: Float, h: String }}\n  E\nend\ndef main\n  let p = Person {{ name: \"a\", age: 1 }}\n  let q = p.clone\n  puts(\"#{{p == q}} #{{p}} #{{R {{ w: 1.0, h: \"x\" }}}} #{{C(1.0) == E}}\")\nend\n");
         check_src(&src).unwrap();
+    }
+
+    #[test]
+    fn symbols_and_ranges() {
+        let info = check_src("def main
+  let s = :a
+  let r = 1..3
+  ()
+end
+").unwrap();
+        let types: Vec<String> = info.expr_types.values().map(|t| t.to_string()).collect();
+        assert!(types.iter().any(|t| t == "Symbol"), "{types:?}");
+        assert!(types.iter().any(|t| t == "Range[Int]"), "{types:?}");
+        assert_eq!(err("def main
+  let r = 1..\"a\"
+end
+"), "type mismatch: expected Int, found String");
+        assert!(err("def main
+  case :a
+  in :a then 1
+  in :b then 2
+  end
+  ()
+end
+").starts_with("non-exhaustive `case`"));
+    }
+
+    #[test]
+    fn loops_break_next_and_for() {
+        assert_eq!(scheme("def f
+  loop
+    break 5
+  end
+end
+def main
+  f
+  ()
+end
+", "f"), "[] [] Int");
+        assert_eq!(scheme("def h
+  let x = loop
+    return
+  end
+  x
+end
+def main
+  h
+end
+", "h"), "[] [] Unit");
+        assert_eq!(err("def main
+  break
+end
+"), "`break` outside of a loop");
+        assert_eq!(err("def main
+  next
+end
+"), "`next` outside of a loop");
+        assert_eq!(err("def main
+  while true
+    break 1
+  end
+end
+"), "`break` with a value is only allowed in `loop`");
+        assert_eq!(err("def main
+  for i in 3
+  end
+end
+"), "`for` needs a `Range[Int]` in this version");
+        assert_eq!(err("def main
+  for i in 1..3
+    i = 2
+  end
+end
+"), "cannot assign twice to immutable variable `i`");
+    }
+
+    /// The closure whose body is named `name` (`main#c0`, ...).
+    fn closure<'i>(info: &'i TypeInfo, name: &str) -> &'i ClosureInfo {
+        info.closures.values().find(|c| c.name == name).unwrap_or_else(|| panic!("no closure {name}"))
+    }
+
+    fn modes(c: &ClosureInfo) -> Vec<(String, CaptureMode)> {
+        c.captures.iter().map(|k| (k.name.clone(), k.mode)).collect()
+    }
+
+    #[test]
+    fn closure_types_and_capture_modes() {
+        let info = check_src("def main\n  let f = { |x: Int| x + 1 }\n  ()\nend\n").unwrap();
+        let c = closure(&info, "main#c0");
+        assert_eq!((c.ty().to_string(), c.captures.len()), ("Int -> Int".to_string(), 0));
+        let info = check_src("def main\n  let y = 2\n  let f = { |x: Int| x + y }\n  ()\nend\n").unwrap();
+        let c = closure(&info, "main#c0");
+        assert_eq!(c.ty().to_string(), "&(Int -> Int)");
+        assert_eq!(modes(c), vec![("y".to_string(), CaptureMode::Shared)]);
+        let info = check_src("def main\n  let mut total = 0\n  let f = { |i: Int| total += i }\n  ()\nend\n").unwrap();
+        assert_eq!(modes(closure(&info, "main#c0")), vec![("total".to_string(), CaptureMode::Mut)]);
+        let info = check_src("def bump(r: &mut Int)\n  let f = { || *r = *r + 1 }\n  ()\nend\ndef main\n  ()\nend\n").unwrap();
+        assert_eq!(modes(closure(&info, "bump#c0")), vec![("r".to_string(), CaptureMode::Reborrow)]);
+        let info = check_src("def main\n  let s = \"a\"\n  let f = move { || s.clone }\n  ()\nend\n").unwrap();
+        let c = closure(&info, "main#c0");
+        assert_eq!((c.ty().to_string(), modes(c)), ("Unit -> String".to_string(), vec![("s".to_string(), CaptureMode::Move)]));
+        // The body is a global with the environment first.
+        assert_eq!(info.globals["main#c0"].scheme.ty.to_string(), "&(String) -> Unit -> String");
+        assert_eq!(info.globals["main#c0"].n_params, 2);
+    }
+
+    #[test]
+    fn nested_closures_capture_through_their_parent() {
+        let info = check_src("def main\n  let mut n = 0\n  let f = { |y: Int|\n    let g = { |x: Int| n += x }\n    g(y)\n  }\n  ()\nend\n").unwrap();
+        let outer = closure(&info, "main#c1");
+        let inner = closure(&info, "main#c0");
+        assert_eq!(modes(outer), vec![("n".to_string(), CaptureMode::Mut)]);
+        assert_eq!(modes(inner), vec![("n".to_string(), CaptureMode::Mut)]);
+        // A closure's own locals and parameters are not captures.
+        let info = check_src("def main\n  let f = { |x: Int|\n    let y = x\n    y\n  }\n  ()\nend\n").unwrap();
+        assert!(closure(&info, "main#c0").captures.is_empty());
+    }
+
+    #[test]
+    fn move_captures_are_read_only() {
+        assert_eq!(err("def main\n  let mut count = 0\n  let f = move { || count += 1 }\nend\n"), "cannot assign to captured `count` in a move closure");
+        assert_eq!(err("def main\n  let mut count = 0\n  let f = move { || &mut count }\nend\n"), "cannot borrow captured `count` as mutable in a move closure");
+        // Writing through a captured `&mut` is not an assignment to the capture.
+        check_src("def set(r: &mut Int)\n  let f = move { || *r = 1 }\n  ()\nend\ndef main\n  ()\nend\n").unwrap();
+    }
+
+    #[test]
+    fn return_break_and_next_in_blocks() {
+        let info = check_src("def main\n  let f = { |x: Int|\n    if x > 0\n      return 1\n    end\n    2\n  }\n  ()\nend\n").unwrap();
+        assert_eq!(closure(&info, "main#c0").ty().to_string(), "Int -> Int");
+        assert_eq!(err("def main\n  while true\n    let f = { || break }\n  end\nend\n"), "`break` outside of a loop");
+        check_src("def main\n  let f = { ||\n    loop\n      break\n    end\n  }\n  ()\nend\n").unwrap();
+    }
+
+    #[test]
+    fn function_values_and_value_calls() {
+        let src = "enum Shape\n  Circle(Float)\nend\nimpl Shape\n  def area(&self) -> Float\n    1.0\n  end\n  def unit(r: Float) -> Shape\n    Circle(r)\n  end\nend\n\
+                   def main\n  let a = Shape.area\n  let n = Shape.unit\n  let w = Some\n  let o = w(1)\n  let z = { || 5 }\n  let v = z()\n  ()\nend\n";
+        let info = check_src(src).unwrap();
+        let types: Vec<String> = info.expr_types.values().map(|t| t.to_string()).collect();
+        for want in ["&Shape -> Float", "Float -> Shape", "Int -> Option[Int]", "Option[Int]", "Unit -> Int"] {
+            assert!(types.iter().any(|t| t == want), "missing {want} in {types:?}");
+        }
+        assert!(info.dots.values().any(|d| matches!(d, DotRes::MethodValue(MethodRes::Direct { global, .. }) if global.ends_with("::area"))));
+        // Trait methods through the type.
+        let info = check_src("def main\n  let s = Int.to_s\n  ()\nend\n").unwrap();
+        assert!(info.expr_types.values().any(|t| t.to_string() == "&Int -> String"));
+        // Calling through a borrowed closure.
+        let info = check_src("def twice(f: &(Int -> Int), x: Int) -> Int\n  f(f(x))\nend\ndef main\n  let k = 1\n  let r = twice({ |x| x + k }, 2)\n  ()\nend\n").unwrap();
+        assert_eq!(closure(&info, "main#c0").ty().to_string(), "&(Int -> Int)");
+    }
+
+    #[test]
+    fn block_parameters_take_the_expected_type() {
+        let src = format!("{POINT}def each_point(f: &(Point -> Unit))\n  f(Point {{ x: 1.0, y: 2.0 }})\nend\ndef main\n  each_point {{ |p| puts(&float_to_s(p.x)) }}\nend\n");
+        let info = check_src(&src).unwrap();
+        assert_eq!(closure(&info, "main#c0").ty().to_string(), "Point -> Unit");
+    }
+
+    #[test]
+    fn borrowing_closure_to_an_owned_parameter_errors() {
+        assert_eq!(
+            err("def keep(f: Int -> Int)\n  ()\nend\ndef main\n  let k = 1\n  keep { |x| x + k }\nend\n"),
+            "function value borrows `k` and cannot be passed as an owned function; use `move` or take `&(Int -> Int)`"
+        );
+        check_src("def keep(f: Int -> Int)\n  ()\nend\ndef main\n  let k = 1\n  keep(move { |x| x + k })\n  keep { |x| x + 1 }\nend\n").unwrap();
+    }
+
+    #[test]
+    fn contains_fn_and_arity() {
+        let info = check_src("struct Handler\n  f: Int -> Int\nend\ndef main\n  ()\nend\n").unwrap();
+        let h = Type::con("Handler");
+        assert!(info.contains_fn(&h) && info.may_borrow(&h) && !info.contains_ref(&h));
+        assert_eq!(arity(&Type::func(&[Type::con("Int"), Type::con("Int")], Type::con("Int"))), 2);
+        assert_eq!(arity(&Type::con("Int")), 0);
     }
 }

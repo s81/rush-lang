@@ -272,7 +272,7 @@ fn respan_expr(e: &mut Expr, sp: Span) {
             args.iter_mut().flatten().for_each(|a| respan_expr(a, sp));
         }
         ExprKind::TupleIndex(r, _) | ExprKind::Ref(_, r) | ExprKind::Deref(r) | ExprKind::Unary(_, r) => respan_expr(r, sp),
-        ExprKind::Binary(_, a, b) | ExprKind::Assign(a, b) => {
+        ExprKind::Binary(_, a, b) | ExprKind::Assign(a, b) | ExprKind::Range(a, b, _) => {
             respan_expr(a, sp);
             respan_expr(b, sp);
         }
@@ -291,6 +291,17 @@ fn respan_expr(e: &mut Expr, sp: Span) {
             respan_expr(cond, sp);
             respan_block(body, sp);
         }
+        ExprKind::Loop(body) => respan_block(body, sp),
+        ExprKind::Closure { params, body, .. } => {
+            params.iter_mut().for_each(|p| p.span = sp);
+            respan_block(body, sp);
+        }
+        ExprKind::For { iter, body, var_span, .. } => {
+            *var_span = sp;
+            respan_expr(iter, sp);
+            respan_block(body, sp);
+        }
+        ExprKind::Break(v) => v.iter_mut().for_each(|x| respan_expr(x, sp)),
         ExprKind::Case { scrutinee, arms } => {
             respan_expr(scrutinee, sp);
             for a in arms {
@@ -308,7 +319,7 @@ fn respan_expr(e: &mut Expr, sp: Span) {
             }
         }),
         ExprKind::Return(v) => v.iter_mut().for_each(|x| respan_expr(x, sp)),
-        ExprKind::Int(_) | ExprKind::Float(_) | ExprKind::Str(_) | ExprKind::Bool(_) | ExprKind::Unit | ExprKind::Var(_) => {}
+        ExprKind::Int(_) | ExprKind::Float(_) | ExprKind::Str(_) | ExprKind::Bool(_) | ExprKind::Unit | ExprKind::Symbol(_) | ExprKind::Var(_) | ExprKind::Next => {}
     }
 }
 

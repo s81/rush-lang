@@ -21,6 +21,7 @@ fn describe(t: &Tok) -> String {
         Tok::Str(s) => format!("string {s:?}"),
         Tok::Interp(_) => "interpolated string".to_string(),
         Tok::Ident(s) => format!("`{s}`"),
+        Tok::Sym(s) => format!("`:{s}`"),
         Tok::Kw(k) => format!("`{k}`"),
         Tok::Op(o) => format!("`{o}`"),
         Tok::Newline => "end of line".to_string(),
@@ -527,6 +528,10 @@ impl Parser {
                 self.bump();
                 Ok(self.mk_pat(PatKind::Lit(Lit::Str(s)), sp))
             }
+            Tok::Sym(s) => {
+                self.bump();
+                Ok(self.mk_pat(PatKind::Lit(Lit::Symbol(s)), sp))
+            }
             Tok::Kw("true") => {
                 self.bump();
                 Ok(self.mk_pat(PatKind::Lit(Lit::Bool(true)), sp))
@@ -628,7 +633,7 @@ impl Parser {
     fn expr(&mut self) -> Result<Expr, Diagnostic> {
         if self.is_kw("return") {
             let sp = self.bump().span;
-            let val = if matches!(self.peek(), Tok::Newline | Tok::Eof) || self.is_kw("end") {
+            let val = if matches!(self.peek(), Tok::Newline | Tok::Eof | Tok::Op("}")) || self.is_kw("end") {
                 None
             } else {
                 Some(Box::new(self.expr()?))
@@ -636,7 +641,7 @@ impl Parser {
             let end = val.as_ref().map(|e| e.span).unwrap_or(sp);
             return Ok(self.mk(ExprKind::Return(val), sp.to(end)));
         }
-        let lhs = self.binary(0)?;
+        let lhs = self.pipe()?;
         let compound: [(&str, Option<BinOp>); 5] = [
             ("=", None),
             ("+=", Some(BinOp::Add)),
@@ -660,6 +665,45 @@ impl Parser {
             }
         }
         Ok(lhs)
+    }
+
+    /// `x |> f(a)` is `f(a, x)`; `x |> f` is `f(x)`; `x |> o.m(a)` is `o.m(a, x)`. Lowest
+    /// precedence, left associative. `a` is evaluated before `x`.
+    fn pipe(&mut self) -> Result<Expr, Diagnostic> {
+        let mut lhs = self.range()?;
+        while self.eat_op("|>") {
+            self.skip_newlines();
+            let rhs = self.range()?;
+            let span = lhs.span.to(rhs.span);
+            let kind = match rhs.kind {
+                ExprKind::Call(f, mut args) => {
+                    args.push(lhs);
+                    ExprKind::Call(f, args)
+                }
+                ExprKind::Dot { recv, name, args } => {
+                    let mut args = args.unwrap_or_default();
+                    args.push(lhs);
+                    ExprKind::Dot { recv, name, args: Some(args) }
+                }
+                _ => ExprKind::Call(Box::new(rhs), vec![lhs]),
+            };
+            lhs = self.mk(kind, span);
+        }
+        Ok(lhs)
+    }
+
+    /// `a..b` and `a...b` bind more loosely than every binary operator and do not chain.
+    fn range(&mut self) -> Result<Expr, Diagnostic> {
+        let lhs = self.binary(0)?;
+        let exclusive = match self.peek() {
+            Tok::Op("..") => false,
+            Tok::Op("...") => true,
+            _ => return Ok(lhs),
+        };
+        self.bump();
+        let rhs = self.binary(0)?;
+        let span = lhs.span.to(rhs.span);
+        Ok(self.mk(ExprKind::Range(Box::new(lhs), Box::new(rhs), exclusive), span))
     }
 
     /// Fresh copy of an assignment target, for desugaring `x += e` and `p.x += e`.
@@ -760,12 +804,29 @@ impl Parser {
         Ok((args, end))
     }
 
+    /// A block literal starts here: `{ |`, `do`, or `move` before either.
+    fn at_block(&self) -> bool {
+        let at = |p: &Self, n: usize| (p.is_op_at(n, "{") && p.is_op_at(n + 1, "|")) || matches!(p.peek_at(n), Tok::Kw("do"));
+        at(self, 0) || (self.is_kw("move") && at(self, 1))
+    }
+
     fn postfix(&mut self) -> Result<Expr, Diagnostic> {
         let mut e = self.primary()?;
+        // `each_item { |x| .. }`: a block after a bare name calls it.
+        if matches!(&e.kind, ExprKind::Var(n) if !is_camel(n)) && self.at_block() {
+            let block = self.closure()?;
+            let span = e.span.to(block.span);
+            e = self.mk(ExprKind::Call(Box::new(e), vec![block]), span);
+        }
         loop {
             if self.is_op("(") {
-                let (args, end) = self.call_args()?;
-                let span = e.span.to(end);
+                let (mut args, end) = self.call_args()?;
+                let mut span = e.span.to(end);
+                if self.at_block() {
+                    let block = self.closure()?;
+                    span = span.to(block.span);
+                    args.push(block);
+                }
                 e = self.mk(ExprKind::Call(Box::new(e), args), span);
             } else if self.is_op(".") {
                 self.bump();
@@ -777,12 +838,17 @@ impl Parser {
                     }
                     Tok::Ident(name) => {
                         let end = self.bump().span;
-                        let (args, end) = if self.is_op("(") {
+                        let (mut args, mut end) = if self.is_op("(") {
                             let (a, end) = self.call_args()?;
                             (Some(a), end)
                         } else {
                             (None, end)
                         };
+                        if self.at_block() {
+                            let block = self.closure()?;
+                            end = block.span;
+                            args.get_or_insert_with(Vec::new).push(block);
+                        }
                         let span = e.span.to(end);
                         e = self.mk(ExprKind::Dot { recv: Box::new(e), name, args }, span);
                     }
@@ -809,6 +875,10 @@ impl Parser {
             Tok::Str(s) => {
                 self.bump();
                 Ok(self.mk(ExprKind::Str(s), sp))
+            }
+            Tok::Sym(s) => {
+                self.bump();
+                Ok(self.mk(ExprKind::Symbol(s), sp))
             }
             Tok::Interp(parts) => {
                 self.bump();
@@ -898,6 +968,37 @@ impl Parser {
                 let end = self.expect_kw("end")?;
                 Ok(self.mk(ExprKind::While { cond: Box::new(cond), body }, sp.to(end)))
             }
+            Tok::Op("{") | Tok::Kw("do") | Tok::Kw("move") if self.at_block() => self.closure(),
+            Tok::Kw("loop") => {
+                self.bump();
+                self.expect_newline()?;
+                let body = self.block_until(&["end"])?;
+                let end = self.expect_kw("end")?;
+                Ok(self.mk(ExprKind::Loop(body), sp.to(end)))
+            }
+            Tok::Kw("for") => {
+                self.bump();
+                let (var, var_span) = self.expect_ident()?;
+                self.expect_kw("in")?;
+                let iter = self.expr()?;
+                self.expect_newline()?;
+                let body = self.block_until(&["end"])?;
+                let end = self.expect_kw("end")?;
+                Ok(self.mk(ExprKind::For { var, var_span, iter: Box::new(iter), body }, sp.to(end)))
+            }
+            Tok::Kw("break") => {
+                self.bump();
+                if matches!(self.peek(), Tok::Newline | Tok::Eof | Tok::Op("}")) || self.is_kw("end") {
+                    return Ok(self.mk(ExprKind::Break(None), sp));
+                }
+                let v = self.expr()?;
+                let span = sp.to(v.span);
+                Ok(self.mk(ExprKind::Break(Some(Box::new(v))), span))
+            }
+            Tok::Kw("next") => {
+                self.bump();
+                Ok(self.mk(ExprKind::Next, sp))
+            }
             _ => Err(self.err("expression")),
         }
     }
@@ -921,6 +1022,53 @@ impl Parser {
         }
         self.next_id = sub.next_id;
         Ok(e)
+    }
+
+    /// `[move] { |params| stmts }` or `[move] do [|params|] stmts end`.
+    fn closure(&mut self) -> Result<Expr, Diagnostic> {
+        let sp = self.span();
+        let is_move = self.eat_kw("move");
+        if self.eat_kw("do") {
+            let params = if self.is_op("|") { self.closure_params()? } else { vec![] };
+            // The lexer already drops a newline after the closing `|` (an operator).
+            self.skip_newlines();
+            let body = self.block_until(&["end"])?;
+            let end = self.expect_kw("end")?;
+            return Ok(self.mk(ExprKind::Closure { params, body, is_move }, sp.to(end)));
+        }
+        self.expect_op("{")?;
+        let params = self.closure_params()?;
+        let start = self.span();
+        let mut stmts = Vec::new();
+        self.skip_newlines();
+        while !self.is_op("}") {
+            if self.at_eof() {
+                return Err(self.err("`}`"));
+            }
+            stmts.push(self.stmt()?);
+            if !self.is_op("}") {
+                self.expect_newline()?;
+            }
+        }
+        let body = Block { stmts, span: start.to(self.prev_span()) };
+        let end = self.expect_op("}")?;
+        Ok(self.mk(ExprKind::Closure { params, body, is_move }, sp.to(end)))
+    }
+
+    /// `|a, b: T|`; `||` (two `|` tokens) is no parameters.
+    fn closure_params(&mut self) -> Result<Vec<ClosureParam>, Diagnostic> {
+        self.expect_op("|")?;
+        let mut params = Vec::new();
+        while !self.is_op("|") {
+            let (name, span) = self.expect_ident()?;
+            let ty = if self.eat_op(":") { Some(self.type_expr()?) } else { None };
+            params.push(ClosureParam { name, ty, span: span.to(self.prev_span()) });
+            if !self.eat_op(",") {
+                break;
+            }
+        }
+        self.expect_op("|")?;
+        Ok(params)
     }
 
     /// Current token is `if` or `elsif`. Consumes through the matching `end`.
@@ -969,8 +1117,15 @@ impl Parser {
                 arms.push(Arm { pat, guard, body, span: arm_start.to(self.prev_span()) });
             } else if self.is_kw("else") {
                 let arm_start = self.bump().span;
-                self.expect_newline()?;
-                let body = self.block_until(&["end"])?;
+                // `else e` on one line, or a block on the following lines.
+                let body = if matches!(self.peek(), Tok::Newline) {
+                    self.block_until(&["end"])?
+                } else {
+                    let e = self.expr()?;
+                    let span = e.span;
+                    self.expect_newline()?;
+                    Block { stmts: vec![Stmt::Expr(e)], span }
+                };
                 let pat = self.mk_pat(PatKind::Wild, arm_start);
                 arms.push(Arm { pat, guard: None, body, span: arm_start.to(self.prev_span()) });
             } else if self.is_kw("end") {
@@ -1052,6 +1207,143 @@ mod tests {
         let e = main_expr("a + 1 < b and c");
         let ExprKind::Binary(BinOp::And, l, _) = &e.kind else { panic!() };
         assert!(matches!(l.kind, ExprKind::Binary(BinOp::Lt, _, _)));
+    }
+
+    #[test]
+    fn ranges_bind_looser_than_arithmetic() {
+        let e = main_expr("1..n - 1");
+        let ExprKind::Range(l, r, false) = &e.kind else { panic!("{:?}", e.kind) };
+        assert!(matches!(l.kind, ExprKind::Int(1)));
+        assert!(matches!(r.kind, ExprKind::Binary(BinOp::Sub, _, _)));
+        assert!(matches!(main_expr("a...b").kind, ExprKind::Range(_, _, true)));
+    }
+
+    #[test]
+    fn symbol_literals_and_patterns() {
+        assert!(matches!(&main_expr(":ok").kind, ExprKind::Symbol(s) if s == "ok"));
+        let e = main_expr("case x
+  in :a then 1
+  in _ then 2
+  end");
+        let ExprKind::Case { arms, .. } = &e.kind else { panic!() };
+        assert!(matches!(&arms[0].pat.kind, PatKind::Lit(Lit::Symbol(s)) if s == "a"));
+    }
+
+    #[test]
+    fn loops_break_next_and_for() {
+        let e = main_expr("loop
+    break 5
+  end");
+        let ExprKind::Loop(b) = &e.kind else { panic!("{:?}", e.kind) };
+        assert!(matches!(&b.stmts[0], Stmt::Expr(x) if matches!(&x.kind, ExprKind::Break(Some(_)))));
+        let e = main_expr("while true
+    next
+    break
+  end");
+        let ExprKind::While { body, .. } = &e.kind else { panic!() };
+        assert!(matches!(&body.stmts[0], Stmt::Expr(x) if matches!(x.kind, ExprKind::Next)));
+        assert!(matches!(&body.stmts[1], Stmt::Expr(x) if matches!(x.kind, ExprKind::Break(None))));
+        let e = main_expr("for i in 1...n
+    i
+  end");
+        let ExprKind::For { var, iter, .. } = &e.kind else { panic!() };
+        assert_eq!(var, "i");
+        assert!(matches!(iter.kind, ExprKind::Range(_, _, true)));
+    }
+
+    #[test]
+    fn case_else_on_one_line() {
+        let e = main_expr("case x
+  in 1 then 2
+  else 3
+  end");
+        let ExprKind::Case { arms, .. } = &e.kind else { panic!() };
+        assert!(matches!(arms[1].pat.kind, PatKind::Wild));
+        assert!(matches!(&arms[1].body.stmts[0], Stmt::Expr(x) if matches!(x.kind, ExprKind::Int(3))));
+    }
+
+    fn closure_of(e: &Expr) -> (&Vec<ClosureParam>, &Block, bool) {
+        match &e.kind {
+            ExprKind::Closure { params, body, is_move } => (params, body, *is_move),
+            other => panic!("expected closure, got {other:?}"),
+        }
+    }
+
+    fn names(ps: &[ClosureParam]) -> Vec<&str> {
+        ps.iter().map(|p| p.name.as_str()).collect()
+    }
+
+    #[test]
+    fn closure_literals() {
+        let e = main_expr("{ |x| x + 1 }");
+        let (ps, body, mv) = closure_of(&e);
+        assert_eq!((names(ps), body.stmts.len(), mv), (vec!["x"], 1, false));
+        let e = main_expr("{ |x: Int, y| x }");
+        let (ps, _, _) = closure_of(&e);
+        assert_eq!(names(ps), vec!["x", "y"]);
+        assert!(matches!(&ps[0].ty, Some(TypeExpr::Name(n, _, _)) if n == "Int"));
+        assert!(ps[1].ty.is_none());
+        assert!(closure_of(&main_expr("{ || 1 }")).0.is_empty());
+        let e = main_expr("do |a|\n    let b = a\n    b\n  end");
+        let (ps, body, _) = closure_of(&e);
+        assert_eq!((names(ps), body.stmts.len()), (vec!["a"], 2));
+        assert!(closure_of(&main_expr("do\n    1\n  end")).0.is_empty());
+        assert!(closure_of(&main_expr("move { |x| x }")).2);
+        assert!(closure_of(&main_expr("move do |x|\n    x\n  end")).2);
+        let e = main_expr("{ |x|\n    let y = x\n    y\n  }");
+        assert_eq!(closure_of(&e).1.stmts.len(), 2);
+    }
+
+    #[test]
+    fn trailing_blocks_become_the_last_argument() {
+        let e = main_expr("f(1) { |x| x }");
+        let ExprKind::Call(f, args) = &e.kind else { panic!("{:?}", e.kind) };
+        assert!(matches!(&f.kind, ExprKind::Var(n) if n == "f"));
+        assert_eq!(args.len(), 2);
+        closure_of(&args[1]);
+        let e = main_expr("f { |x| x }");
+        let ExprKind::Call(_, args) = &e.kind else { panic!("{:?}", e.kind) };
+        assert_eq!(args.len(), 1);
+        let e = main_expr("xs.each do |x|\n    x\n  end");
+        let ExprKind::Dot { name, args: Some(args), .. } = &e.kind else { panic!("{:?}", e.kind) };
+        assert_eq!((name.as_str(), args.len()), ("each", 1));
+        let e = main_expr("o.m(1) { |x| x }");
+        let ExprKind::Dot { args: Some(args), .. } = &e.kind else { panic!("{:?}", e.kind) };
+        assert_eq!(args.len(), 2);
+        let e = main_expr("f(1) move { |x| x }");
+        let ExprKind::Call(_, args) = &e.kind else { panic!() };
+        assert!(closure_of(&args[1]).2);
+        assert!(matches!(main_expr("Point { x: 1 }").kind, ExprKind::StructLit { .. }));
+    }
+
+    #[test]
+    fn pipes_supply_the_last_argument() {
+        let e = main_expr("x |> f");
+        let ExprKind::Call(f, args) = &e.kind else { panic!("{:?}", e.kind) };
+        assert!(matches!(&f.kind, ExprKind::Var(n) if n == "f"));
+        assert!(matches!(&args[0].kind, ExprKind::Var(n) if n == "x"));
+        // x |> f(a) |> g  is  g(f(a, x))
+        let e = main_expr("x |> f(a) |> g");
+        let ExprKind::Call(g, outer) = &e.kind else { panic!() };
+        assert!(matches!(&g.kind, ExprKind::Var(n) if n == "g"));
+        let ExprKind::Call(_, inner) = &outer[0].kind else { panic!() };
+        assert!(matches!(&inner[0].kind, ExprKind::Var(n) if n == "a"));
+        assert!(matches!(&inner[1].kind, ExprKind::Var(n) if n == "x"));
+        let e = main_expr("x |> o.m(1)");
+        let ExprKind::Dot { args: Some(args), .. } = &e.kind else { panic!() };
+        assert!(matches!(&args[1].kind, ExprKind::Var(n) if n == "x"));
+        let e = main_expr("x |> o.m");
+        let ExprKind::Dot { args: Some(args), .. } = &e.kind else { panic!() };
+        assert_eq!(args.len(), 1);
+        let e = main_expr("x |> { |v| v }");
+        let ExprKind::Call(f, _) = &e.kind else { panic!() };
+        closure_of(f);
+        let e = main_expr("x |>\n    f(1) |>\n    g");
+        assert!(matches!(&e.kind, ExprKind::Call(g, _) if matches!(&g.kind, ExprKind::Var(n) if n == "g")));
+        // Pipes bind more loosely than ranges and arithmetic.
+        let e = main_expr("1 + 2 |> f");
+        let ExprKind::Call(_, args) = &e.kind else { panic!() };
+        assert!(matches!(args[0].kind, ExprKind::Binary(BinOp::Add, _, _)));
     }
 
     #[test]

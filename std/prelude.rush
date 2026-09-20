@@ -5,6 +5,7 @@ extern "C" def float_to_s(v: Float) -> String
 extern "C" def bool_to_s(v: Bool) -> String
 extern "C" def str_concat(a: &String, b: &String) -> String
 extern "C" def str_clone(s: &String) -> String
+extern "C" def sym_to_s(s: Symbol) -> String
 extern "C" def gc_collect_now() -> Unit
 extern "C" def gc_live() -> Int
 
@@ -35,6 +36,13 @@ enum Option[T]
   None
 end
 
+# `a..b` includes `stop`; `a...b` excludes it.
+struct Range[T]
+  start: T
+  stop: T
+  exclusive: Bool
+end
+
 impl Show for Int
   def to_s(&self)
     int_to_s(self)
@@ -59,6 +67,25 @@ impl Show for String
   end
   def inspect(&self)
     "\"#{self}\""
+  end
+end
+
+impl Show for Symbol
+  def to_s(&self)
+    sym_to_s(*self)
+  end
+  def inspect(&self)
+    ":#{sym_to_s(*self)}"
+  end
+end
+
+impl[T: Show] Show for Range[T]
+  def to_s(&self)
+    if @exclusive
+      "#{@start}...#{@stop}"
+    else
+      "#{@start}..#{@stop}"
+    end
   end
 end
 
@@ -97,6 +124,12 @@ end
 
 impl Eq for Bool
   def eq(&self, other: &Bool)
+    self == other
+  end
+end
+
+impl Eq for Symbol
+  def eq(&self, other: &Symbol)
     self == other
   end
 end
@@ -142,6 +175,15 @@ impl Clone for Bool
 end
 
 impl Copy for Bool
+end
+
+impl Clone for Symbol
+  def clone(&self)
+    *self
+  end
+end
+
+impl Copy for Symbol
 end
 
 impl Clone for Unit

@@ -1,0 +1,6 @@
+def main
+  let base = 1
+  let f = { |x: Int| x + base }
+  let g = Gc.new(f)
+  ()
+end
