@@ -20,6 +20,19 @@ pub enum Type {
     Con(String, Vec<Type>),
     /// Curried function type.
     Fn(Box<Type>, Box<Type>),
+    /// The abstracted parameter of a type constructor: `Option[_]` is `Con("Option", [Hole])`.
+    Hole,
+    /// `F[A]`, kept only while the head is a `Var` or a `Param`.
+    App(Box<Type>, Box<Type>),
+}
+
+/// Applies a type constructor to an argument. `apply(Con("Option", [Hole]), Int)` is
+/// `Option[Int]`; a head that is still a variable stays an `App`.
+pub fn apply(head: Type, arg: Type) -> Type {
+    match head {
+        Type::Con(n, args) => Type::Con(n, args.into_iter().map(|a| if a == Type::Hole { arg.clone() } else { a }).collect()),
+        h => Type::App(Box::new(h), Box::new(arg)),
+    }
 }
 
 impl Type {
@@ -91,7 +104,8 @@ impl Type {
             Type::Var(_) => true,
             Type::Param(_) => false,
             Type::Con(_, args) => args.iter().any(Type::has_var),
-            Type::Fn(a, b) => a.has_var() || b.has_var(),
+            Type::Fn(a, b) | Type::App(a, b) => a.has_var() || b.has_var(),
+            Type::Hole => false,
         }
     }
     pub fn has_param(&self) -> bool {
@@ -99,7 +113,8 @@ impl Type {
             Type::Var(_) => false,
             Type::Param(_) => true,
             Type::Con(_, args) => args.iter().any(Type::has_param),
-            Type::Fn(a, b) => a.has_param() || b.has_param(),
+            Type::Fn(a, b) | Type::App(a, b) => a.has_param() || b.has_param(),
+            Type::Hole => false,
         }
     }
     /// Variables in first-occurrence order.
@@ -112,10 +127,11 @@ impl Type {
             }
             Type::Param(_) => {}
             Type::Con(_, args) => args.iter().for_each(|a| a.vars(out)),
-            Type::Fn(a, b) => {
+            Type::Fn(a, b) | Type::App(a, b) => {
                 a.vars(out);
                 b.vars(out);
             }
+            Type::Hole => {}
         }
     }
 }
@@ -157,6 +173,8 @@ impl fmt::Display for Type {
                 Type::Fn(..) => write!(f, "({a}) -> {b}"),
                 _ => write!(f, "{a} -> {b}"),
             },
+            Type::Hole => write!(f, "_"),
+            Type::App(h, a) => write!(f, "{h}[{a}]"),
         }
     }
 }
@@ -168,6 +186,9 @@ pub fn subst(t: &Type, map: &HashMap<String, Type>) -> Type {
         Type::Param(p) => map.get(p).cloned().unwrap_or_else(|| t.clone()),
         Type::Con(n, args) => Type::Con(n.clone(), args.iter().map(|a| subst(a, map)).collect()),
         Type::Fn(a, b) => Type::Fn(Box::new(subst(a, map)), Box::new(subst(b, map))),
+        Type::Hole => Type::Hole,
+        // Substituting the head with a constructor collapses the application.
+        Type::App(h, a) => apply(subst(h, map), subst(a, map)),
     }
 }
 
@@ -415,7 +436,7 @@ impl TypeInfo {
     /// Whether values of `t` copy on use. `param_copy` answers for type parameters.
     pub fn is_copy(&self, t: &Type, param_copy: &dyn Fn(&str) -> bool) -> bool {
         match t {
-            Type::Var(_) => false,
+            Type::Var(_) | Type::Hole | Type::App(..) => false,
             Type::Param(p) => param_copy(p),
             Type::Fn(..) => true,
             Type::Con(n, args) => match n.as_str() {
@@ -457,6 +478,9 @@ impl TypeInfo {
     fn contains_in(&self, t: &Type, leaf: &dyn Fn(&Type) -> bool, through_refs: bool, visiting: &mut Vec<Type>) -> bool {
         if leaf(t) {
             return true;
+        }
+        if let Type::App(h, a) = t {
+            return self.contains_in(h, leaf, through_refs, visiting) || self.contains_in(a, leaf, through_refs, visiting);
         }
         let Type::Con(n, args) = t else { return false };
         if !through_refs && (n == "&" || n == "&mut") {
@@ -554,7 +578,21 @@ pub struct TypeEnv<'a> {
 pub const BUILTIN_TYPES: &[&str] = &["Int", "Float", "Bool", "String", "Unit", "Symbol"];
 
 pub fn from_ast(t: &TypeExpr, env: &TypeEnv) -> Result<Type, Diagnostic> {
+    from_ast_in(t, env, false)
+}
+
+/// An impl head may contain one `_`: the hole of the type constructor it names.
+pub fn from_ast_head(t: &TypeExpr, env: &TypeEnv) -> Result<Type, Diagnostic> {
+    from_ast_in(t, env, true)
+}
+
+fn from_ast_in(t: &TypeExpr, env: &TypeEnv, allow_hole: bool) -> Result<Type, Diagnostic> {
+    let from_ast = |t: &TypeExpr, env: &TypeEnv| from_ast_in(t, env, allow_hole);
     match t {
+        TypeExpr::Hole(span) => match allow_hole {
+            true => Ok(Type::Hole),
+            false => Err(Diagnostic::new(*span, "`_` is only allowed in an impl head")),
+        },
         TypeExpr::Ref(m, inner, _) => Ok(Type::r#ref(*m, from_ast(inner, env)?)),
         TypeExpr::Tuple(items, _) => {
             let mut ts = Vec::new();
@@ -573,10 +611,12 @@ pub fn from_ast(t: &TypeExpr, env: &TypeEnv) -> Result<Type, Diagnostic> {
                 };
             }
             if env.generics.contains(name) {
-                if !args.is_empty() {
-                    return Err(Diagnostic::new(*span, format!("type parameter `{name}` takes no type arguments")));
+                // `F[A]` applies a constructor-kinded parameter; kinds are inferred from use.
+                let mut ty = Type::Param(name.clone());
+                for a in args {
+                    ty = apply(ty, from_ast(a, env)?);
                 }
-                return Ok(Type::Param(name.clone()));
+                return Ok(ty);
             }
             let name = match name.as_str() {
                 "i64" => "Int",
@@ -604,6 +644,35 @@ pub fn from_ast(t: &TypeExpr, env: &TypeEnv) -> Result<Type, Diagnostic> {
     }
 }
 
+/// A type parameter is a type or a type constructor, never both in one signature.
+pub fn check_kinds(t: &Type, span: Span) -> Result<(), Diagnostic> {
+    let (mut applied, mut bare) = (Vec::new(), Vec::new());
+    walk_kinds(t, &mut applied, &mut bare);
+    match applied.iter().find(|p| bare.contains(p)) {
+        Some(p) => Err(Diagnostic::new(span, format!("type parameter `{p}` is used both as a type and as a type constructor"))),
+        None => Ok(()),
+    }
+}
+
+fn walk_kinds(t: &Type, applied: &mut Vec<String>, bare: &mut Vec<String>) {
+    match t {
+        Type::Param(p) => bare.push(p.clone()),
+        Type::App(h, a) => {
+            match &**h {
+                Type::Param(p) => applied.push(p.clone()),
+                other => walk_kinds(other, applied, bare),
+            }
+            walk_kinds(a, applied, bare);
+        }
+        Type::Con(_, args) => args.iter().for_each(|a| walk_kinds(a, applied, bare)),
+        Type::Fn(a, b) => {
+            walk_kinds(a, applied, bare);
+            walk_kinds(b, applied, bare);
+        }
+        Type::Var(_) | Type::Hole => {}
+    }
+}
+
 pub fn check(prog: &Program) -> Result<TypeInfo, Diagnostic> {
     infer::check_program(prog)
 }
@@ -611,6 +680,18 @@ pub fn check(prog: &Program) -> Result<TypeInfo, Diagnostic> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn constructors_apply_and_display() {
+        let option = Type::Con("Option".into(), vec![Type::Hole]);
+        assert_eq!(apply(option.clone(), Type::con("Int")).to_string(), "Option[Int]");
+        assert_eq!(Type::Con("Result".into(), vec![Type::Hole, Type::Param("E".into())]).to_string(), "Result[_, E]");
+        // An unresolved head keeps the application; substituting it collapses it.
+        let f = Type::App(Box::new(Type::Param("F".into())), Box::new(Type::con("Int")));
+        assert_eq!(f.to_string(), "F[Int]");
+        let map = HashMap::from([("F".to_string(), option)]);
+        assert_eq!(subst(&f, &map).to_string(), "Option[Int]");
+    }
 
     #[test]
     fn display() {

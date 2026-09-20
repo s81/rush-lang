@@ -462,6 +462,7 @@ impl<'a> Checker<'a> {
                 }
             };
             let ty = Type::func(&params, ret);
+            check_kinds(&ty, d.span)?;
             let generalize = !is_extern && !annotated && generics.is_empty();
             let scheme = if generalize { Scheme::mono(ty) } else { Scheme { vars: generics.clone(), bounds: bounds.clone(), ty } };
             let kind = if is_extern { GlobalKind::Extern } else { GlobalKind::Def };

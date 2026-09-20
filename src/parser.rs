@@ -434,6 +434,9 @@ impl Parser {
             let s = self.bump().span;
             return Ok(TypeExpr::Name("Self".into(), vec![], s));
         }
+        if matches!(self.peek(), Tok::Ident(n) if n == "_") {
+            return Ok(TypeExpr::Hole(self.bump().span));
+        }
         let (name, nsp) = self.expect_ident()?;
         let mut args = Vec::new();
         if self.eat_op("[") {

@@ -40,6 +40,7 @@ fn type_text(t: &TypeExpr) -> String {
         TypeExpr::Tuple(items, _) => format!("({})", items.iter().map(type_text).collect::<Vec<_>>().join(", ")),
         TypeExpr::Fn(a, b, _) => format!("{} -> {}", type_text(a), type_text(b)),
         TypeExpr::Ref(m, inner, _) => format!("&{}{}", if *m { "mut " } else { "" }, type_text(inner)),
+        TypeExpr::Hole(_) => "_".to_string(),
     }
 }
 
@@ -220,6 +221,7 @@ fn respan_type(t: &mut TypeExpr, sp: Span) {
             *s = sp;
             respan_type(inner, sp);
         }
+        TypeExpr::Hole(s) => *s = sp,
     }
 }
 

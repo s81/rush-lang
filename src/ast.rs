@@ -125,12 +125,14 @@ pub enum TypeExpr {
     Fn(Box<TypeExpr>, Box<TypeExpr>, Span),
     /// `&T` (false) or `&mut T` (true); erased until Plan 3
     Ref(bool, Box<TypeExpr>, Span),
+    /// `_`, the abstracted parameter of a type constructor in an impl head
+    Hole(Span),
 }
 
 impl TypeExpr {
     pub fn span(&self) -> Span {
         match self {
-            TypeExpr::Name(_, _, s) | TypeExpr::Tuple(_, s) | TypeExpr::Fn(_, _, s) | TypeExpr::Ref(_, _, s) => *s,
+            TypeExpr::Name(_, _, s) | TypeExpr::Tuple(_, s) | TypeExpr::Fn(_, _, s) | TypeExpr::Ref(_, _, s) | TypeExpr::Hole(s) => *s,
         }
     }
 }

@@ -21,6 +21,7 @@ pub fn mangle_type(t: &Type) -> String {
         Type::Fn(a, b) => format!("Fn_L_{}__{}_R", mangle_type(a), mangle_type(b)),
         Type::Param(p) => panic!("mangle_type: unexpected type parameter {p}"),
         Type::Var(v) => panic!("mangle_type: unexpected inference variable ?{v}"),
+        Type::Hole | Type::App(..) => panic!("mangle_type: unapplied type constructor {t}"),
     }
 }
 

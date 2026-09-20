@@ -14,7 +14,8 @@ fn occurs(v: u32, t: &Type) -> bool {
         Type::Var(x) => *x == v,
         Type::Param(_) => false,
         Type::Con(_, args) => args.iter().any(|a| occurs(v, a)),
-        Type::Fn(a, b) => occurs(v, a) || occurs(v, b),
+        Type::Fn(a, b) | Type::App(a, b) => occurs(v, a) || occurs(v, b),
+        Type::Hole => false,
     }
 }
 
@@ -32,6 +33,9 @@ impl Infer {
             Type::Param(_) => t.clone(),
             Type::Con(n, args) => Type::Con(n.clone(), args.iter().map(|a| self.resolve(a)).collect()),
             Type::Fn(a, b) => Type::Fn(Box::new(self.resolve(a)), Box::new(self.resolve(b))),
+            Type::Hole => Type::Hole,
+            // A head that has resolved to a constructor fills its hole here.
+            Type::App(h, a) => apply(self.resolve(h), self.resolve(a)),
         }
     }
     pub fn unify(&mut self, expected: &Type, found: &Type, span: Span) -> Result<(), Diagnostic> {
@@ -56,6 +60,22 @@ impl Infer {
             (Type::Fn(a1, r1), Type::Fn(a2, r2)) => {
                 self.unify(a1, a2, span)?;
                 self.unify(r1, r2, span)
+            }
+            (Type::Hole, Type::Hole) => Ok(()),
+            (Type::App(h1, x1), Type::App(h2, x2)) => {
+                self.unify(h1, h2, span)?;
+                self.unify(x1, x2, span)
+            }
+            // `F[A]` against a concrete type: the hole is the constructor's first parameter,
+            // so `M[A]` against `Result[Int, String]` gives `M = Result[_, String]`, `A = Int`.
+            (Type::App(h, x), Type::Con(n, args)) | (Type::Con(n, args), Type::App(h, x)) => {
+                if args.is_empty() {
+                    return Err(Diagnostic::new(span, format!("`{n}` takes no type arguments, so it cannot be used as `F[A]`")));
+                }
+                let mut head = args.clone();
+                head[0] = Type::Hole;
+                self.unify(h, &Type::Con(n.clone(), head), span)?;
+                self.unify(x, &args[0], span)
             }
             _ => Err(Diagnostic::new(span, format!("type mismatch: expected {a}, found {b}"))),
         }
@@ -621,6 +641,8 @@ impl<'a> Checker<'a> {
             Type::Param(_) => t.clone(),
             Type::Con(n, args) => Type::Con(n.clone(), args.iter().map(|a| self.var_to_param(a)).collect()),
             Type::Fn(a, b) => Type::Fn(Box::new(self.var_to_param(a)), Box::new(self.var_to_param(b))),
+            Type::Hole => Type::Hole,
+            Type::App(h, a) => apply(self.var_to_param(h), self.var_to_param(a)),
         }
     }
 
@@ -1624,6 +1646,8 @@ fn default_vars(t: &Type) -> Type {
         Type::Param(_) => t.clone(),
         Type::Con(n, args) => Type::Con(n.clone(), args.iter().map(default_vars).collect()),
         Type::Fn(a, b) => Type::Fn(Box::new(default_vars(a)), Box::new(default_vars(b))),
+        Type::Hole => Type::Hole,
+        Type::App(h, a) => apply(default_vars(h), default_vars(a)),
     }
 }
 
@@ -1847,6 +1871,51 @@ mod tests {
 
     const POINT: &str = "struct Point\n  x: Float\n  y: Float\nend\n";
     const PERSON: &str = "struct Person\n  derive Show, Eq, Clone\n  name: String\n  age: Int\nend\n";
+
+    #[test]
+    fn type_constructors_unify_and_have_kinds() {
+        // `F[A]` against a concrete type splits off the first parameter.
+        let mut inf = Infer { subst: vec![] };
+        let (h, x) = (inf.fresh(), inf.fresh());
+        let app = Type::App(Box::new(h.clone()), Box::new(x.clone()));
+        let concrete = Type::Con("Result".into(), vec![Type::con("Int"), Type::con("String")]);
+        inf.unify(&app, &concrete, Span::default()).unwrap();
+        assert_eq!(inf.resolve(&h).to_string(), "Result[_, String]");
+        assert_eq!(inf.resolve(&x).to_string(), "Int");
+        // Once the head is known the application collapses to the concrete type.
+        assert_eq!(inf.resolve(&app).to_string(), "Result[Int, String]");
+        // A type with no parameters is not a constructor.
+        let mut inf = Infer { subst: vec![] };
+        let (h, x) = (inf.fresh(), inf.fresh());
+        let app = Type::App(Box::new(h), Box::new(x));
+        let e = inf.unify(&app, &Type::con("Int"), Span::default()).unwrap_err();
+        assert_eq!(e.msg, "`Int` takes no type arguments, so it cannot be used as `F[A]`");
+        // Kinds are inferred from use, and a parameter cannot be both.
+        check_src("def f[F](x: F[Int], y: F[Bool]) -> Int
+  1
+end
+def main
+  ()
+end
+").unwrap();
+        assert_eq!(
+            err("def f[F](x: F[Int], y: F) -> Int
+  1
+end
+def main
+  ()
+end
+"),
+            "type parameter `F` is used both as a type and as a type constructor"
+        );
+        assert_eq!(err("def f(x: _) -> Int
+  1
+end
+def main
+  ()
+end
+"), "`_` is only allowed in an impl head");
+    }
 
     #[test]
     fn result_is_in_the_prelude() {
