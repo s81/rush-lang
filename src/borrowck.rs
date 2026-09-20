@@ -149,8 +149,10 @@ impl<'a> Bc<'a> {
 
     fn operand_loans(&self, holds: &[Bits], op: &Operand) -> Bits {
         match op {
-            Operand::Place(p) => holds[p.local as usize].clone(),
-            Operand::Const(_) => Bits::new(self.n()),
+            // A value read out of a place carries the place's loans only if it can hold one:
+            // an `Int` copied out of a capture environment borrows nothing.
+            Operand::Place(p) if self.info.may_borrow(&place_type(self.info, self.body, p)) => holds[p.local as usize].clone(),
+            _ => Bits::new(self.n()),
         }
     }
 
@@ -835,6 +837,9 @@ end
         ok(&fns("def main\n  let mut total = 0\n  let mut k = 0\n  while k < 3\n    each_to(3) { |i| total += i }\n    k += 1\n  end\n  puts(&int_to_s(total))\nend\n"));
         // Owned function values leave their function.
         ok(&fns("def adder(k: Int) -> Int -> Int\n  move { |x| x + k }\nend\ndef inc -> Int -> Int\n  add(1)\nend\ndef main\n  let a = adder(1)\n  let b = keep(inc)\n  ()\nend\n"));
+        // A `move` closure nested in another copies `Copy` captures out of the outer
+        // environment, so the inner value borrows nothing and can be returned.
+        ok(&fns("def nested(base: Int) -> Int -> Int -> Int\n  move { |a| move { |b| base + a + b } }\nend\ndef main\n  ()\nend\n"));
         // A captured `&mut` is reborrowed for the closure's life, then usable again.
         ok(&fns("def bump(r: &mut Int) -> Int\n  let f = { || *r = *r + 1 }\n  f()\n  f()\n  *r\nend\ndef main\n  let mut x = 1\n  bump(&mut x)\n  ()\nend\n"));
         assert_eq!(
