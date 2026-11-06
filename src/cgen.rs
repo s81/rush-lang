@@ -568,6 +568,11 @@ impl<'a> Gen<'a> {
                     BinOp::Add if is_int && self.debug => format!("rush_add_i64_checked({l}, {r})"),
                     BinOp::Sub if is_int && self.debug => format!("rush_sub_i64_checked({l}, {r})"),
                     BinOp::Mul if is_int && self.debug => format!("rush_mul_i64_checked({l}, {r})"),
+                    // Release builds wrap. Host C signed overflow is undefined, so use helpers
+                    // that compute in the corresponding unsigned type and convert back.
+                    BinOp::Add if is_int => format!("rush_add_i64_wrapping({l}, {r})"),
+                    BinOp::Sub if is_int => format!("rush_sub_i64_wrapping({l}, {r})"),
+                    BinOp::Mul if is_int => format!("rush_mul_i64_wrapping({l}, {r})"),
                     BinOp::Div if is_int => format!("rush_div_i64({l}, {r})"),
                     BinOp::Rem if is_int => format!("rush_rem_i64({l}, {r})"),
                     BinOp::Rem => format!("fmod({l}, {r})"),
@@ -726,6 +731,38 @@ fn strip_pointers(t: &Type) -> Type {
 }
 
 pub fn gen(bodies: &[Body], info: &TypeInfo, debug: bool) -> String {
+    gen_with_entry(bodies, info, debug, None)
+}
+
+/// Emits a binary whose entry selects one of `tests` by `argv[1]`. `rush test` runs the same
+/// executable once per test so a panic or `abort` in one test cannot stop the others.
+pub fn gen_tests(bodies: &[Body], info: &TypeInfo, debug: bool, tests: &[String]) -> String {
+    gen_with_entry(bodies, info, debug, Some(tests))
+}
+
+fn entry_code(tests: Option<&[String]>) -> String {
+    let mut c = String::new();
+    match tests {
+        None => c.push_str("static void rush_entry(int argc, char **argv) {\n  (void)argc;\n  (void)argv;\n  rush_main();\n}\n\n"),
+        Some(tests) => {
+            c.push_str("static void rush_entry(int argc, char **argv) {\n  if (argc < 2) {\n    rush_panic(\"test mode requires a test name\");\n    return;\n  }\n");
+            for t in tests {
+                writeln!(
+                    c,
+                    "  if (strcmp(argv[1], {}) == 0) {{\n    rush_{}();\n    return;\n  }}",
+                    c_string_lit(t),
+                    crate::mono::mangle_fn(t, &[])
+                )
+                .unwrap();
+            }
+            c.push_str("  rush_panic(\"unknown test name\");\n}\n\n");
+        }
+    }
+    c.push_str("int main(int argc, char **argv) {\n  return rush_rt_run(argc, argv, rush_entry);\n}\n");
+    c
+}
+
+fn gen_with_entry(bodies: &[Body], info: &TypeInfo, debug: bool, tests: Option<&[String]>) -> String {
     let syms = symbols(bodies);
     let mut g = Gen {
         info,
@@ -739,7 +776,7 @@ pub fn gen(bodies: &[Body], info: &TypeInfo, debug: bool) -> String {
     g.sites = sites;
     g.site_at = site_at;
     let mut c = String::new();
-    c.push_str("#include \"rush_rt.h\"\n#include <math.h>\n#include <stdlib.h>\n\n");
+    c.push_str("#include \"rush_rt.h\"\n#include <math.h>\n#include <stdlib.h>\n#include <string.h>\n\n");
     for (i, s) in syms.iter().enumerate() {
         writeln!(c, "static const char rush_sym_{i}[] = {};", c_string_lit(s)).unwrap();
     }
@@ -764,7 +801,7 @@ pub fn gen(bodies: &[Body], info: &TypeInfo, debug: bool) -> String {
     for s in &g.sites {
         c.push_str(&g.entry(s));
     }
-    c.push_str("static void rush_entry(void) {\n  rush_main();\n}\n\nint main(int argc, char **argv) {\n  return rush_rt_run(argc, argv, rush_entry);\n}\n");
+    c.push_str(&entry_code(tests));
     c
 }
 
@@ -793,6 +830,21 @@ mod tests {
         gen_src_dbg(s, false)
     }
 
+    fn gen_src_tests(s: &str, tests: &[&str]) -> String {
+        let prelude = include_str!("../std/prelude.rush");
+        let mut id = 0;
+        let mut p = parse(lex(prelude).unwrap(), &mut id).unwrap();
+        p.items.extend(parse(lex(s).unwrap(), &mut id).unwrap().items);
+        crate::derive::expand(&mut p, &mut id).unwrap();
+        let info = check(&p).unwrap();
+        let mut bodies = lower(&p, &info).unwrap();
+        crate::ownck::check_and_insert_drops(&mut bodies, &info).unwrap();
+        let roots = tests.iter().map(|t| ((*t).to_string(), vec![])).collect();
+        let bodies = crate::mono::monomorphize_from(bodies, &info, roots).unwrap();
+        let names: Vec<String> = tests.iter().map(|t| t.to_string()).collect();
+        gen_tests(&bodies, &info, false, &names)
+    }
+
     #[test]
     fn emits_prototype_definition_and_main() {
         let c = gen_src(
@@ -804,6 +856,7 @@ mod tests {
         assert!(c.contains("  _2 = (_1 < INT64_C(2));\n"));
         assert!(c.contains("  if (_2) goto bb1; else goto bb2;\n"));
         assert!(c.contains("  _5 = rush_fib(_4);\n"));
+        assert!(c.contains("static void rush_entry(int argc, char **argv) {\n  (void)argc;\n  (void)argv;\n  rush_main();\n}\n"), "{c}");
         assert!(c.contains("int main(int argc, char **argv) {\n  return rush_rt_run(argc, argv, rush_entry);\n}\n"));
     }
 
@@ -864,8 +917,28 @@ mod tests {
         assert!(c.contains(" = rush_gc_borrow(*_"), "{c}");
         assert!(c.contains("rush_add_i64_checked("), "{c}");
         assert!(c.contains("rush_mul_i64_checked("), "{c}");
-        let c2 = gen_src("def main\n  let n = 1 + 2\n  ()\nend\n");
+        assert!(!c.contains("_wrapping("), "{c}");
+        // Release builds wrap rather than relying on C signed-overflow undefined behaviour.
+        let c2 = gen_src("def main\n  let n = 1 + 2\n  let m = n - 1\n  let p = n * 3\n  ()\nend\n");
+        assert!(c2.contains("rush_add_i64_wrapping("), "{c2}");
+        assert!(c2.contains("rush_sub_i64_wrapping("), "{c2}");
+        assert!(c2.contains("rush_mul_i64_wrapping("), "{c2}");
         assert!(!c2.contains("checked"), "{c2}");
+    }
+
+    #[test]
+    fn test_entry_dispatches_by_name() {
+        let c = gen_src_tests(
+            "def test_first\n  ()\nend\ndef test_second\n  ()\nend\ndef main\n  ()\nend\n",
+            &["test_first", "test_second"],
+        );
+        assert!(c.contains("static void rush_entry(int argc, char **argv) {"), "{c}");
+        assert!(c.contains("strcmp(argv[1], \"test_first\") == 0"), "{c}");
+        assert!(c.contains("    rush_test_first();\n"), "{c}");
+        assert!(c.contains("strcmp(argv[1], \"test_second\") == 0"), "{c}");
+        assert!(c.contains("rush_panic(\"unknown test name\")"), "{c}");
+        // Only the requested tests are rooted; `main` is not emitted or called.
+        assert!(!c.contains("rush_main();"), "{c}");
     }
 
     #[test]

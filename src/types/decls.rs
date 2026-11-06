@@ -78,6 +78,7 @@ impl<'a> Checker<'a> {
                         let ft = from_ast(&f.ty, &env)?;
                         fields.push((f.name.clone(), ft));
                     }
+                    check_type_kinded(&fields.iter().map(|(_, t)| t.clone()).collect::<Vec<_>>(), &format!("`{}`", s.name), s.span)?;
                     self.info.structs.insert(s.name.clone(), StructInfo { generics, fields, span: s.span });
                 }
                 Item::Enum(e) => {
@@ -107,6 +108,7 @@ impl<'a> Checker<'a> {
                                 }
                             }
                         }
+                        check_type_kinded(&fields.iter().map(|(_, t)| t.clone()).collect::<Vec<_>>(), &format!("`{}`", e.name), v.span)?;
                         let params: Vec<Type> = generics.iter().map(|g| Type::Param(g.clone())).collect();
                         let ctor_ty = Type::func(&fields.iter().map(|(_, t)| t.clone()).collect::<Vec<_>>(), Type::Con(e.name.clone(), params));
                         self.info.globals.insert(
@@ -182,6 +184,7 @@ impl<'a> Checker<'a> {
             (None, Some((_, r))) => r.clone(),
             (None, None) => Type::unit(),
         };
+        check_kinds(&Type::func(&params, ret.clone()), d.span)?;
         Ok((params, ret))
     }
 
@@ -199,6 +202,7 @@ impl<'a> Checker<'a> {
             Some(t) => from_ast(t, &env)?,
             None => Type::unit(),
         };
+        check_kinds(&Type::func(&params, ret.clone()), d.span)?;
         Ok((params, ret))
     }
 
@@ -280,6 +284,7 @@ impl<'a> Checker<'a> {
             let generics = generic_names(&imp.generics)?;
             let bounds = self.check_bounds(&imp.generics)?;
             let self_ty = from_ast(&imp.self_ty, &TypeEnv { adts: &self.adts, generics: &generics, self_ty: None })?;
+            check_type_kinded(std::slice::from_ref(&self_ty), "an impl", imp.self_ty.span())?;
             if let Some(tn) = &imp.trait_name {
                 if !self.info.traits.contains_key(tn) {
                     return Err(Diagnostic::new(imp.span, format!("unknown trait `{tn}`")));

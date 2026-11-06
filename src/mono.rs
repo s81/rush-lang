@@ -21,7 +21,9 @@ pub fn mangle_type(t: &Type) -> String {
         Type::Fn(a, b) => format!("Fn_L_{}__{}_R", mangle_type(a), mangle_type(b)),
         Type::Param(p) => panic!("mangle_type: unexpected type parameter {p}"),
         Type::Var(v) => panic!("mangle_type: unexpected inference variable ?{v}"),
-        Type::Hole | Type::App(..) => panic!("mangle_type: unapplied type constructor {t}"),
+        // A constructor-kinded type argument such as `Option[_]` names an instance.
+        Type::Hole => "Hole".into(),
+        Type::App(..) => panic!("mangle_type: unapplied type constructor {t}"),
     }
 }
 
@@ -251,8 +253,15 @@ impl<'a> Mono<'a> {
 }
 
 pub fn monomorphize(bodies: Vec<Body>, info: &TypeInfo) -> Result<Vec<Body>, Diagnostic> {
+    monomorphize_from(bodies, info, vec![("main".into(), vec![])])
+}
+
+/// Instantiates every generic reachable from `roots`. A root is a global name and its type
+/// arguments (`main` has none; a test function is rooted by name so it is emitted even though
+/// `main` does not call it).
+pub fn monomorphize_from(bodies: Vec<Body>, info: &TypeInfo, roots: Vec<(String, Vec<Type>)>) -> Result<Vec<Body>, Diagnostic> {
     let by_name: HashMap<String, &Body> = bodies.iter().map(|b| (b.name.clone(), b)).collect();
-    let mut m = Mono { info, by_name, queue: vec![("main".into(), vec![])], done: HashSet::new(), counts: HashMap::new() };
+    let mut m = Mono { info, by_name, queue: roots, done: HashSet::new(), counts: HashMap::new() };
     let mut out = Vec::new();
     loop {
         let start = out.len();
@@ -287,7 +296,7 @@ mod tests {
     use crate::parser::parse;
     use crate::types::check;
 
-    fn mono_src(s: &str) -> Result<Vec<Body>, Diagnostic> {
+    fn mono_roots(s: &str, roots: Vec<(String, Vec<Type>)>) -> Result<Vec<Body>, Diagnostic> {
         let prelude = include_str!("../std/prelude.rush");
         let mut id = 0;
         let mut p = parse(lex(prelude).unwrap(), &mut id).unwrap();
@@ -296,7 +305,11 @@ mod tests {
         let info = check(&p)?;
         let mut bodies = lower(&p, &info)?;
         crate::ownck::check_and_insert_drops(&mut bodies, &info)?;
-        monomorphize(bodies, &info)
+        monomorphize_from(bodies, &info, roots)
+    }
+
+    fn mono_src(s: &str) -> Result<Vec<Body>, Diagnostic> {
+        mono_roots(s, vec![("main".into(), vec![])])
     }
 
     #[test]
@@ -322,6 +335,17 @@ mod tests {
     }
 
     #[test]
+    fn roots_instantiate_only_what_that_root_reaches() {
+        let src = "def id[T](x: T) -> T\n  x\nend\ndef test_uses_id\n  id(1)\n  ()\nend\ndef main\n  id(true)\n  ()\nend\n";
+        let bodies = mono_roots(src, vec![("test_uses_id".into(), vec![])]).unwrap();
+        let names: Vec<String> = bodies.into_iter().map(|b| b.name).collect();
+        assert!(names.contains(&"test_uses_id".to_string()), "{names:?}");
+        assert!(names.contains(&"id__Int".to_string()), "{names:?}");
+        assert!(!names.contains(&"id__Bool".to_string()), "{names:?}");
+        assert!(!names.contains(&"main".to_string()), "{names:?}");
+    }
+
+    #[test]
     fn generic_def_instantiated_per_use_and_unused_generic_dropped() {
         let src = "def id[T](x: T) -> T\n  x\nend\ndef unused[T](x: T) -> T\n  x\nend\ndef main\n  id(1)\n  id(true)\n  ()\nend\n";
         assert_eq!(names(src), vec!["id__Bool", "id__Int", "main"]);
@@ -341,6 +365,12 @@ mod tests {
         let src = "trait A\n  def a(&self) -> Int\n  def b(&self) -> Int\n    self.a + 1\n  end\nend\nstruct S\n  f: Int\nend\nimpl A for S\n  def a(&self)\n    self.f\n  end\nend\ndef main\n  S { f: 1 }.b\n  ()\nend\n";
         let n = names(src);
         assert!(n.contains(&"A_b__S".to_string()), "{n:?}");
+    }
+
+    #[test]
+    fn constructor_kinded_def_instantiated_per_constructor() {
+        let src = "def f[F](x: F[Int]) -> Int\n  1\nend\ndef main\n  f(Some(1))\n  ()\nend\n";
+        assert!(names(src).contains(&"f__Option_L_Hole_R".to_string()));
     }
 
     #[test]

@@ -1,7 +1,7 @@
 # Rush, Stage 1 design
 
 Date: 2026-09-17
-Status: approved section by section by the project owner in the brainstorming session; awaiting written review.
+Status: approved section by section by the project owner in the brainstorming session. Plans 1-4a, the `Result` part of Plan 4b, and `rush test` are implemented; the rest of Plans 4b and 5 is in progress.
 
 ## Goal
 
@@ -139,7 +139,7 @@ end
 ## 2. Ownership, borrowing, and the GC
 
 - Every value has exactly one owner. Assignment, argument passing, and return move the value unless its type is `Copy`.
-- `Copy` types: all integer types, `Float`, `Bool`, `Char`, `Symbol`, `Unit`, `&T`, `Gc[T]`, function values with no captured non-`Copy` environment, and tuples of `Copy` types. User structs and enums may derive `Copy` when all fields are `Copy`.
+- `Copy` types: all integer types, `Float`, `Bool`, `Char`, `Symbol`, `Unit`, `&T`, `Gc[T]`, owned function values (`A -> B`; a non-`move` closure with captures has type `&(A -> B)` and is not `Copy`), and tuples of `Copy` types. User structs and enums may derive `Copy` when all fields are `Copy`.
 - `&x` creates a shared borrow, `&mut x` a mutable borrow, and `*r` dereferences. At any program point a place has either one live `&mut` or any number of live `&`. A place cannot be moved or assigned while borrowed. Liveness is computed on the MIR control-flow graph, so a borrow ends at its last use, not at scope end.
 - Method receivers auto-borrow: for `def m(&self)` the call `x.m` borrows `&x`; for `&mut self` it borrows `&mut x`; for `self` it moves `x`.
 - Stage 1 has no lifetime syntax. Functions returning a reference follow Rust's elision rules: one reference parameter, or a `&self`/`&mut self` receiver, determines the output lifetime. If elision cannot decide, the compiler reports an error that suggests returning an owned value.
@@ -147,6 +147,7 @@ end
 - `Gc[T]` is the only route to shared, cyclic, or long-lived-without-owner data. `Gc.new(v)` moves `v` onto the collected heap and returns a `Copy` handle. `g.borrow` returns `&T` and `g.borrow_mut` returns `&mut T`. Both are checked at runtime with a borrow count in the object header; a violation panics. The returned reference is borrow-checked at compile time like any other reference.
 - Closures capture free variables by shared or mutable reference, whichever the body needs, or by value with `move`. A closure literal has type `A -> B` when it is `move` or captures nothing, and `&(A -> B)` otherwise. An owned `A -> B` is `Copy`, keeps its environment on the GC heap, and can be stored and returned. A `&(A -> B)` keeps its environment on the stack and holds loans on its captures, so returning it, storing it in a struct or `Gc`, or passing it where the parameter type is owned is a compile error that suggests `move`.
 - The GC is a conservative, non-moving, stop-the-world mark-sweep collector in C. It scans the C stack between a recorded base and the current stack pointer, a registered set of global roots, and the bodies of reachable GC objects word by word. Only `Gc[T]` cells and escaping closure environments live on the GC heap, so it stays small. Stage 2 registers each green-thread stack as an additional root range.
+- Only GC payload memory is traced. A malloc-backed structure (a runtime registry, a foreign buffer) that holds a live `Gc` handle must call `rush_gc_register_roots` with a scan function that marks each handle, and unregister it before the storage disappears; otherwise the collector may free the handle's object.
 
 ## 3. Type system
 
@@ -188,6 +189,10 @@ C mapping:
 
 Build flow: `rush build main.rush` writes `main.c` and `rush_rt.c` into a `.rush-build/` directory, invokes the C compiler with `-O2` (or `-O0 -g` with `--debug`), and places the binary beside the source. `rush run` builds then executes.
 
+`rush test` roots monomorphization at each top-level `def test_*` with no receiver, parameters, or generics; a test file may omit `main`. The generated entry dispatches on `argv[1]`, and the driver runs the binary once per test in a fresh process, so a panic or `abort` fails only that test.
+
+Release builds emit wrapping helpers for integer `+`, `-`, and `*`; `--debug` uses checked helpers that panic on overflow. Division and remainder check for zero in both modes. `Float.to_s` uses the shortest `%g` representation that round-trips, always includes a decimal point, and prints `NaN`, `Infinity`, and `-Infinity`.
+
 ## 5. Standard library, Stage 1
 
 Implemented in an embedded `std/prelude.rush` where possible, with `extern "C"` primitives in the runtime.
@@ -202,9 +207,9 @@ Implemented in an embedded `std/prelude.rush` where possible, with `extern "C"` 
 ## 6. Testing
 
 - Unit tests in each Rust module use small inline programs and assert on tokens, AST shape, inferred types, or diagnostic text.
-- `tests/programs/*.rush` each have a `.out` file. A Rust integration test compiles every program through the full pipeline and the C compiler, runs it, and diffs stdout against `.out`.
-- `tests/errors/*.rush` each have a `.err` file holding the expected diagnostic. They cover type mismatches, missing instances, non-exhaustive matches, use after move, conflicting borrows, and escaping non-`move` closures.
-- `rush test file.rush` compiles the file and runs every `def test_*` function, reporting pass or fail per test. Stage 3's self-hosting suite uses this.
+- `tests/programs/*.rush` each have a `.out` file. A Rust integration test copies every program into a fresh temporary directory, compiles it through the full pipeline and the C compiler, runs it, and diffs stdout against `.out`. A sibling `.err` file marks a program that must panic: the process must fail and its `panic:` messages must match exactly.
+- `tests/errors/*.rush` each have a `.err` file holding the expected diagnostic. They cover type mismatches, missing instances, non-exhaustive matches, use after move, conflicting borrows, and escaping non-`move` closures. The rendered `error:` and `note:` messages are compared exactly, ignoring only the echoed source and caret lines.
+- `rush test file.rush` compiles the file and runs every eligible `def test_*` function, reporting pass or fail per test. Each test runs in its own process so one panic cannot stop the others; a file with no tests exits successfully without looking for a C compiler. Stage 3's self-hosting suite uses this.
 - Development is test-first: each pipeline stage gets a failing test before its implementation.
 
 ## 7. Diagnostics

@@ -1,4 +1,5 @@
 #include "rush_rt.h"
+#include <math.h>
 #include <setjmp.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -13,16 +14,18 @@ void rush_rt_init(int argc, char **argv) {
     (void)argv;
 }
 
-int rush_rt_run(int argc, char **argv, void (*entry)(void)) {
+int rush_rt_run(int argc, char **argv, void (*entry)(int, char **)) {
     volatile uintptr_t marker = 0;
-    (void)argc;
-    (void)argv;
     rush_stack_base = (uintptr_t)&marker;
-    entry();
+    entry(argc, argv);
+    /* stdout is buffered, so a write error may only surface at the final flush. */
+    if (fflush(stdout) != 0) rush_panic("failed to flush stdout");
     return 0;
 }
 
 void rush_panic(const char *msg) {
+    /* A panic aborts without flushing stdio, so flush what the program already printed. */
+    (void)fflush(stdout);
     fprintf(stderr, "panic: %s\n", msg);
     fflush(stderr);
     abort();
@@ -131,16 +134,34 @@ int64_t rush_mul_i64_checked(int64_t a, int64_t b) {
     return r;
 }
 
+/* Unsigned arithmetic has defined wraparound; the conversion back to int64_t is implementation
+   defined in C99 but is two's complement on every target Rush supports. */
+int64_t rush_add_i64_wrapping(int64_t a, int64_t b) {
+    return (int64_t)((uint64_t)a + (uint64_t)b);
+}
+
+int64_t rush_sub_i64_wrapping(int64_t a, int64_t b) {
+    return (int64_t)((uint64_t)a - (uint64_t)b);
+}
+
+int64_t rush_mul_i64_wrapping(int64_t a, int64_t b) {
+    return (int64_t)((uint64_t)a * (uint64_t)b);
+}
+
 /* ---------- IO ---------- */
 
+static void rush_stdout_write(const void *p, size_t n) {
+    if (n != 0 && fwrite(p, 1, n, stdout) != n) rush_panic("failed to write to stdout");
+}
+
 rush_unit rush_puts(const rush_str *s) {
-    fwrite(s->ptr, 1, s->len, stdout);
-    fputc('\n', stdout);
+    rush_stdout_write(s->ptr, s->len);
+    if (fputc('\n', stdout) == EOF) rush_panic("failed to write to stdout");
     return RUSH_UNIT;
 }
 
 rush_unit rush_print(const rush_str *s) {
-    fwrite(s->ptr, 1, s->len, stdout);
+    rush_stdout_write(s->ptr, s->len);
     return RUSH_UNIT;
 }
 
@@ -150,16 +171,50 @@ rush_str rush_int_to_s(int64_t v) {
     return rush_str_own(buf, (size_t)n);
 }
 
-rush_str rush_float_to_s(double v) {
-    char buf[64];
-    int n = snprintf(buf, sizeof buf, "%.15g", v);
-    /* Print whole floats as `2.0` like Ruby, not `2`. */
-    if (strspn(buf, "-0123456789") == (size_t)n) {
-        buf[n++] = '.';
-        buf[n++] = '0';
-        buf[n] = 0;
+/* Shortest `%g` form that parses back to exactly `v`, then Ruby-shaped: a decimal point is
+   always present and exponents have no leading zeros (`1.0e+6`, not `1e+06`). */
+static size_t rush_float_normalize(const char *in, size_t n, char *out) {
+    const char *e = strchr(in, 'e');
+    if (!e) e = strchr(in, 'E');
+    size_t mantissa = e ? (size_t)(e - in) : n;
+    size_t o = 0;
+    memcpy(out, in, mantissa);
+    o = mantissa;
+    if (!memchr(in, '.', mantissa)) {
+        out[o++] = '.';
+        out[o++] = '0';
     }
-    return rush_str_own(buf, (size_t)n);
+    if (e) {
+        out[o++] = 'e';
+        const char *p = e + 1;
+        char sign = '+';
+        if (*p == '+' || *p == '-') sign = *p++;
+        while (*p == '0' && p[1] != '\0') p++;
+        out[o++] = sign;
+        size_t digits = strlen(p);
+        memcpy(out + o, p, digits);
+        o += digits;
+    }
+    out[o] = '\0';
+    return o;
+}
+
+rush_str rush_float_to_s(double v) {
+    if (isnan(v)) return rush_str_lit("NaN", 3);
+    if (isinf(v)) return v < 0 ? rush_str_lit("-Infinity", 9) : rush_str_lit("Infinity", 8);
+    char buf[64];
+    int n = 0;
+    for (int precision = 1; precision <= 17; precision++) {
+        n = snprintf(buf, sizeof buf, "%.*g", precision, v);
+        if (n < 0 || (size_t)n >= sizeof buf) break;
+        char *end = NULL;
+        double back = strtod(buf, &end);
+        if (end && *end == '\0' && back == v) break;
+    }
+    if (n < 0 || (size_t)n >= sizeof buf) n = snprintf(buf, sizeof buf, "%.17g", v);
+    char out[96];
+    size_t len = rush_float_normalize(buf, (size_t)n, out);
+    return rush_str_own(out, len);
 }
 
 rush_str rush_bool_to_s(bool v) {
@@ -168,8 +223,15 @@ rush_str rush_bool_to_s(bool v) {
 
 /* ---------- garbage collector ----------
  * Conservative, non-moving, stop-the-world mark-sweep. Every object has a header followed by
- * the payload. Roots are the C stack (registers spilled with setjmp) scanned word by word.
+ * the payload. Roots are the C stack (registers spilled with setjmp), registered global-root
+ * callbacks, and the bodies of reachable GC objects, scanned word by word.
  * A word is a pointer if it lands inside any live object (binary search over sorted ranges).
+ *
+ * Only GC payloads are traced. If a GC payload points into malloc-backed storage (for example
+ * a string buffer or a C-side registry), that storage is not scanned for further GC handles:
+ * every live handle must also be reachable from a stack frame, a registered global root, or a
+ * GC payload. Runtime structures that hold `Gc` handles across collections must register a
+ * root scan with `rush_gc_register_roots`.
  */
 
 typedef struct rush_gc_hdr {
@@ -191,6 +253,9 @@ static size_t gc_sorted_len;
 
 static rush_gc_hdr **gc_mark_stack;
 static size_t gc_mark_len, gc_mark_cap;
+
+static rush_gc_root_fn *gc_roots;
+static size_t gc_roots_len, gc_roots_cap;
 
 static int gc_cmp(const void *a, const void *b) {
     uintptr_t x = (uintptr_t)*(rush_gc_hdr *const *)a;
@@ -233,6 +298,35 @@ static void gc_scan_range(uintptr_t lo, uintptr_t hi) {
     }
 }
 
+void rush_gc_mark_ptr(const void *p) {
+    if (p) gc_mark_word((uintptr_t)p);
+}
+
+void rush_gc_mark_range(const void *base, size_t len) {
+    if (base && len) gc_scan_range((uintptr_t)base, (uintptr_t)base + len);
+}
+
+void rush_gc_register_roots(rush_gc_root_fn scan) {
+    if (!scan) return;
+    for (size_t i = 0; i < gc_roots_len; i++)
+        if (gc_roots[i] == scan) return;
+    if (gc_roots_len == gc_roots_cap) {
+        gc_roots_cap = gc_roots_cap ? gc_roots_cap * 2 : 8;
+        gc_roots = (rush_gc_root_fn *)realloc(gc_roots, gc_roots_cap * sizeof *gc_roots);
+        if (!gc_roots) rush_panic("out of memory");
+    }
+    gc_roots[gc_roots_len++] = scan;
+}
+
+void rush_gc_unregister_roots(rush_gc_root_fn scan) {
+    for (size_t i = 0; i < gc_roots_len; i++) {
+        if (gc_roots[i] != scan) continue;
+        memmove(&gc_roots[i], &gc_roots[i + 1], (gc_roots_len - i - 1) * sizeof *gc_roots);
+        gc_roots_len--;
+        return;
+    }
+}
+
 static void gc_collect_from(uintptr_t stack_top) {
     /* Sorted index of objects for pointer identification. */
     gc_sorted = (rush_gc_hdr **)realloc(gc_sorted, (gc_count ? gc_count : 1) * sizeof *gc_sorted);
@@ -249,6 +343,8 @@ static void gc_collect_from(uintptr_t stack_top) {
     uintptr_t hi = stack_top < rush_stack_base ? rush_stack_base : stack_top;
     gc_mark_len = 0;
     gc_scan_range(lo, hi + sizeof(uintptr_t));
+    for (size_t i = 0; i < gc_roots_len; i++)
+        gc_roots[i]();
     while (gc_mark_len) {
         rush_gc_hdr *h = gc_mark_stack[--gc_mark_len];
         uintptr_t start = (uintptr_t)(h + 1);

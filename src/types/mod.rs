@@ -27,10 +27,11 @@ pub enum Type {
 }
 
 /// Applies a type constructor to an argument. `apply(Con("Option", [Hole]), Int)` is
-/// `Option[Int]`; a head that is still a variable stays an `App`.
+/// `Option[Int]`; a head that is still a variable stays an `App`, and so does a head with
+/// no hole, which `unify` then reports instead of dropping the argument.
 pub fn apply(head: Type, arg: Type) -> Type {
     match head {
-        Type::Con(n, args) => Type::Con(n, args.into_iter().map(|a| if a == Type::Hole { arg.clone() } else { a }).collect()),
+        Type::Con(n, args) if args.contains(&Type::Hole) => Type::Con(n, args.into_iter().map(|a| if a == Type::Hole { arg.clone() } else { a }).collect()),
         h => Type::App(Box::new(h), Box::new(arg)),
     }
 }
@@ -612,11 +613,12 @@ fn from_ast_in(t: &TypeExpr, env: &TypeEnv, allow_hole: bool) -> Result<Type, Di
             }
             if env.generics.contains(name) {
                 // `F[A]` applies a constructor-kinded parameter; kinds are inferred from use.
-                let mut ty = Type::Param(name.clone());
-                for a in args {
-                    ty = apply(ty, from_ast(a, env)?);
-                }
-                return Ok(ty);
+                // A constructor has exactly one hole, so it takes exactly one argument.
+                return match args.as_slice() {
+                    [] => Ok(Type::Param(name.clone())),
+                    [a] => Ok(apply(Type::Param(name.clone()), from_ast(a, env)?)),
+                    _ => Err(Diagnostic::new(*span, format!("type parameter `{name}` takes one type argument, found {}", args.len()))),
+                };
             }
             let name = match name.as_str() {
                 "i64" => "Int",
@@ -650,6 +652,17 @@ pub fn check_kinds(t: &Type, span: Span) -> Result<(), Diagnostic> {
     walk_kinds(t, &mut applied, &mut bare);
     match applied.iter().find(|p| bare.contains(p)) {
         Some(p) => Err(Diagnostic::new(span, format!("type parameter `{p}` is used both as a type and as a type constructor"))),
+        None => Ok(()),
+    }
+}
+
+/// Struct, enum, and impl parameters are always types: they appear bare as arguments of the
+/// type they parameterize, so applying one would make it both kinds.
+pub fn check_type_kinded(ts: &[Type], what: &str, span: Span) -> Result<(), Diagnostic> {
+    let (mut applied, mut bare) = (Vec::new(), Vec::new());
+    ts.iter().for_each(|t| walk_kinds(t, &mut applied, &mut bare));
+    match applied.first() {
+        Some(p) => Err(Diagnostic::new(span, format!("type parameter `{p}` of {what} must be a type, not a type constructor"))),
         None => Ok(()),
     }
 }
@@ -691,6 +704,8 @@ mod tests {
         assert_eq!(f.to_string(), "F[Int]");
         let map = HashMap::from([("F".to_string(), option)]);
         assert_eq!(subst(&f, &map).to_string(), "Option[Int]");
+        // A head with no hole keeps its argument, so `unify` can report it.
+        assert_eq!(apply(Type::con("Int"), Type::con("Bool")).to_string(), "Int[Bool]");
     }
 
     #[test]

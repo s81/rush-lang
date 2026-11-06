@@ -1,5 +1,6 @@
 /* Standalone check of the collector: build with the runtime and run. Exit code 0 on success. */
 #include "rush_rt.h"
+#include <math.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -58,7 +59,27 @@ static void make_cycles(void) {
 
 static int status = 1;
 
-static void body(void) {
+/* A handle that lives only in a C global: without a registered root scan the collector must
+   not keep it alive. `install_global_root` is noinline so no stack slot in `body` holds it. */
+static pair *global_root;
+
+static void scan_global_root(void) {
+    rush_gc_mark_ptr(global_root);
+}
+
+#if defined(__GNUC__) || defined(__clang__)
+__attribute__((noinline))
+#endif
+static void install_global_root(int64_t value) {
+    pair *p = (pair *)rush_gc_alloc(sizeof(pair), NULL);
+    p->a = value;
+    p->b = value + 1;
+    global_root = p;
+}
+
+static void body(int argc, char **argv) {
+    (void)argc;
+    (void)argv;
     int64_t sum = churn(100);
     if (sum < 0) return;
     if (sum != 45 + 1000) {
@@ -88,7 +109,40 @@ static void body(void) {
     rush_str_drop(&both);
     rush_str_drop(&owned);
     rush_str_drop(&lit);
+    /* Float formatting round-trips the shortest representation and handles specials. */
+    rush_str precise = rush_float_to_s(0.1 + 0.2);
+    if (!rush_str_eq(precise, rush_str_lit("0.30000000000000004", 19))) {
+        printf("float formatting lost precision: %.*s\n", (int)precise.len, (const char *)precise.ptr);
+        return;
+    }
+    rush_str_drop(&precise);
+    rush_str whole = rush_float_to_s(4.0);
+    if (!rush_str_eq(whole, rush_str_lit("4.0", 3))) {
+        printf("float formatting missed the decimal point: %.*s\n", (int)whole.len, (const char *)whole.ptr);
+        return;
+    }
+    rush_str_drop(&whole);
+    rush_str nan = rush_float_to_s(NAN);
+    rush_str inf = rush_float_to_s(-INFINITY);
+    if (!rush_str_eq(nan, rush_str_lit("NaN", 3)) || !rush_str_eq(inf, rush_str_lit("-Infinity", 9))) {
+        printf("float formatting missed a special value\n");
+        return;
+    }
+    rush_str_drop(&nan);
+    rush_str_drop(&inf);
     if (rush_add_i64_checked(1, 2) != 3 || rush_mul_i64_checked(-3, 4) != -12) return;
+    if (rush_add_i64_wrapping(INT64_MAX, 1) != INT64_MIN) return;
+    if (rush_sub_i64_wrapping(INT64_MIN, 1) != INT64_MAX) return;
+    if (rush_mul_i64_wrapping(INT64_MIN, -1) != INT64_MIN) return;
+    /* Registered global roots survive a collection even when no frame mentions them. */
+    rush_gc_register_roots(scan_global_root);
+    install_global_root(123);
+    rush_gc_collect();
+    if (!global_root || global_root->a != 123 || global_root->b != 124) {
+        printf("registered global root was collected\n");
+        return;
+    }
+    rush_gc_unregister_roots(scan_global_root);
     /* Runtime borrow flags: shared borrows stack, a mutable one needs them all released. The
        panicking paths are covered by tests/programs/gc_conflict.rush. */
     pair *b = (pair *)rush_gc_alloc(sizeof(pair), NULL);

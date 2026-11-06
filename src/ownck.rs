@@ -279,8 +279,11 @@ fn check_body(body: &mut Body, info: &TypeInfo) -> Result<(), Diagnostic> {
                     };
                     let whole_tracked = target.proj.is_empty() && flag_of.contains_key(&target.local);
                     let old_live = whole_tracked && (st.live[target.local as usize] || st.partial[target.local as usize]);
+                    // `x = x` (and any RHS that moves `x` into itself, such as `x = f(x)`) moves
+                    // the old value instead of dropping it before the assignment.
+                    let rhs_moves_target = moved.iter().any(|&m| m == target.local);
                     ck.step(&mut st, s)?;
-                    if old_live {
+                    if old_live && !rhs_moves_target {
                         em.guarded(flag_of[&target.local], vec![Statement::Drop(Place::local(target.local), *span)]);
                     }
                     em.cur.push(s.clone());
@@ -376,6 +379,30 @@ mod tests {
         let first_drop = d.find("drop(_1)").unwrap();
         let second_assign = d.find("_1 = \"b\"").unwrap();
         assert!(first_drop < second_assign, "{d}");
+    }
+
+    fn assert_no_drop_before(d: &str, assign: &str) {
+        let at = d.find(assign).unwrap_or_else(|| panic!("missing `{assign}` in:\n{d}"));
+        for (i, _) in d.match_indices("drop(_1)") {
+            assert!(i > at, "drop before `{assign}` in:\n{d}");
+        }
+        assert!(d[at..].contains("drop(_1)"), "no drop after `{assign}` in:\n{d}");
+    }
+
+    #[test]
+    fn assigning_a_local_from_itself_does_not_drop_the_moved_value() {
+        // `s = s` moves the old value back into the same place. Dropping it before the
+        // assignment would free a value that is then stored and dropped again at scope exit.
+        // The drop may appear on several exit paths, so check ordering rather than counting.
+        let d = dump_fn("def main\n  let mut s = \"a\"\n  s = s\n  ()\nend\n", "main");
+        assert_no_drop_before(&d, "_1 = _1");
+        // The same holds when the RHS is a call that consumes the target.
+        let d = dump_fn(
+            "def rewrap(s: String) -> String\n  s\nend\ndef main\n  let mut s = \"a\"\n  s = rewrap(s)\n  ()\nend\n",
+            "main",
+        );
+        // MIR stores the call result in a temporary before assigning it to `_1`.
+        assert_no_drop_before(&d, "_1 = _2");
     }
 
     #[test]

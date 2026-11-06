@@ -1915,6 +1915,54 @@ def main
   ()
 end
 "), "`_` is only allowed in an impl head");
+        // A constructor has one hole, so it takes one argument.
+        assert_eq!(err("def f[F](x: F[Int, Bool]) -> Int
+  1
+end
+def main
+  ()
+end
+"), "type parameter `F` takes one type argument, found 2");
+        // Methods are kind-checked like functions.
+        assert_eq!(
+            err("struct S
+  a: Int
+end
+impl S
+  def m[F](&self, x: F[Int], y: F) -> Int
+    1
+  end
+end
+def main
+  ()
+end
+"),
+            "type parameter `F` is used both as a type and as a type constructor"
+        );
+        // Struct, enum, and impl parameters are types.
+        assert_eq!(err("struct W[F]
+  x: F[Int]
+end
+def main
+  ()
+end
+"), "type parameter `F` of `W` must be a type, not a type constructor");
+        assert_eq!(err("enum E[F]
+  A(F[Int])
+end
+def main
+  ()
+end
+"), "type parameter `F` of `E` must be a type, not a type constructor");
+        assert_eq!(err("impl[F] Show for F[Int]
+  def to_s(&self)
+    \"x\"
+  end
+end
+def main
+  ()
+end
+"), "type parameter `F` of an impl must be a type, not a type constructor");
     }
 
     #[test]

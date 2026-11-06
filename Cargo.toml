@@ -2,9 +2,17 @@
 name = "rush"
 version = "0.1.0"
 edition = "2021"
+description = "A compiled language with Go-style binaries, Haskell-style types, Rust-style ownership, and Ruby-style syntax."
+repository = "https://github.com/s81/rush-lang"
+readme = "README.md"
 
 [dependencies]
 
 [[bin]]
 name = "rush"
 path = "src/main.rs"
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true

@@ -1,0 +1,16 @@
+def test_pass
+  puts("pass runs")
+end
+
+def test_fail
+  let x = 1 / 0
+  puts(int_to_s(x))
+end
+
+def test_with_params(n: Int)
+  puts("not a test: #{n}")
+end
+
+def main
+  puts("main should not run")
+end

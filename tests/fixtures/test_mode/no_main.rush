@@ -1,0 +1,3 @@
+def test_only
+  puts("only test")
+end

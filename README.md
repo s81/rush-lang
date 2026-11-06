@@ -136,12 +136,61 @@ end
 
 Needs a C compiler on PATH (`cc`, `gcc`, `clang`, `tcc`, or `zig cc`) or `RUSH_CC="path/to/cc"`.
 
+## Install on Windows
+
+Download `rush-v0.1.0-x86_64-pc-windows-msvc.zip` from the
+[releases page](https://github.com/s81/rush-lang/releases), unzip it wherever you
+like, and add that folder to `PATH`:
+
+    rush --version
+    rush run examples\hello.rush
+
+The package contains `rush.exe`, this README, the changelog, and
+`examples/hello.rush`. Building programs still needs a C compiler on `PATH`
+(MinGW-w64 gcc, LLVM clang, tcc, or Zig) or `RUSH_CC` pointing at one. The
+compiler embeds its prelude and C runtime, so there is nothing else to install.
+
+## Release a Windows build
+
+Push a tag that matches the version in `Cargo.toml`. The `Release` workflow runs
+on `windows-latest`, builds the MSVC binary, smoke-tests the packaged compiler on
+`examples/hello.rush`, uploads the zip and checksum, and publishes the GitHub
+release:
+
+    git tag v0.1.0
+    git push origin v0.1.0
+
+To build and package locally from PowerShell:
+
+    ./scripts/package-windows.ps1
+
+If PowerShell blocks local scripts, run
+`powershell -ExecutionPolicy Bypass -File scripts/package-windows.ps1` instead.
+Artifacts land in `dist/` as `rush-v<version>-<target>.zip` plus a `.sha256`.
+Pass `-SkipSmokeTest` to skip compiling the example, or `-SkipBuild` to package
+an existing `target/<target>/release/rush.exe`. The workflow can also be started
+manually with an existing tag.
+
 ## Use
 
     rush build hello.rush     # writes hello(.exe) next to the source
     rush run hello.rush       # build and run
     rush build hello.rush --debug
+    rush test hello.rush      # run every top-level `def test_*` in its own process
 
 ## Test
 
     cargo test
+
+`cargo test` runs the module tests, the golden programs in `tests/programs`, the diagnostics in
+`tests/errors`, the collector check in `runtime/gc_test.c`, and the `rush test` harness test.
+Program cases run in a fresh temporary directory so builds never write beside the fixtures.
+The C compiler comes from `RUSH_CC` (split like a small shell, so quoted paths work) or the
+first of `cc`, `gcc`, `clang`, `tcc`, and `zig cc` on `PATH`.
+
+## Status
+
+The compiler implements Plans 1 through 4a, the `Result` half of Plan 4b, and `rush test` from
+Plan 5. Plan 4b's higher-kinded `Functor`/`Applicative`/`Monad` traits, and Plan 5's full
+standard library, imports, and sized integers remain. The design document lists the known Stage 1
+limitations. CI runs the suite with gcc and clang on Linux/macOS and MinGW gcc on Windows.

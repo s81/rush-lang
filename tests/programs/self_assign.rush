@@ -1,0 +1,21 @@
+struct Tagged
+  name: String
+end
+
+impl Drop for Tagged
+  def drop(&mut self)
+    puts("drop #{@name}")
+  end
+end
+
+def rewrap(t: Tagged) -> Tagged
+  t
+end
+
+def main
+  let mut a = Tagged { name: "a" }
+  a = a
+  let mut b = Tagged { name: "b" }
+  b = rewrap(b)
+  puts("done")
+end

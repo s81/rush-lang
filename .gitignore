@@ -1,6 +1,8 @@
 .rush-build/
 target/
+dist/
 .remember/
+.claude/settings.local.json
 tests/programs/*
 !tests/programs/*.rush
 !tests/programs/*.out
