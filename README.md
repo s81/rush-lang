@@ -193,4 +193,4 @@ first of `cc`, `gcc`, `clang`, `tcc`, and `zig cc` on `PATH`.
 The compiler implements Plans 1 through 4a, the `Result` half of Plan 4b, and `rush test` from
 Plan 5. Plan 4b's higher-kinded `Functor`/`Applicative`/`Monad` traits, and Plan 5's full
 standard library, imports, and sized integers remain. The design document lists the known Stage 1
-limitations. CI runs the suite with gcc and clang on Linux/macOS and MinGW gcc on Windows.
+limitations. CI runs the suite with gcc and clang on Linux/macOS and UCRT64 MinGW gcc on Windows.

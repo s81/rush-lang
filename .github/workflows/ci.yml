@@ -25,21 +25,26 @@ jobs:
       - run: cargo test
 
   windows:
-    name: test (windows-latest, mingw-w64 gcc)
+    name: test (windows-latest, ucrt64 gcc)
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: msys2/setup-msys2@v2
+        id: msys2
         with:
-          msystem: MINGW64
+          msystem: UCRT64
           update: true
-          install: mingw-w64-x86_64-gcc
+          install: mingw-w64-ucrt-x86_64-gcc
       - name: Add MinGW to PATH
         shell: pwsh
-        run: echo "C:\msys64\mingw64\bin" >> $env:GITHUB_PATH
+        run: |
+          $bin = Join-Path '${{ steps.msys2.outputs.msys2-location }}' 'ucrt64\bin'
+          echo $bin >> $env:GITHUB_PATH
       - name: Test
         shell: pwsh
-        run: cargo test
-        env:
-          RUSH_CC: C:\msys64\mingw64\bin\gcc.exe
+        run: |
+          $gcc = Get-Command gcc -ErrorAction SilentlyContinue
+          if (-not $gcc) { throw "gcc was not found on PATH" }
+          $env:RUSH_CC = $gcc.Source
+          cargo test

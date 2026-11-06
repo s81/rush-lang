@@ -28,14 +28,17 @@ jobs:
           targets: x86_64-pc-windows-msvc
 
       - uses: msys2/setup-msys2@v2
+        id: msys2
         with:
-          msystem: MINGW64
+          msystem: UCRT64
           update: true
-          install: mingw-w64-x86_64-gcc
+          install: mingw-w64-ucrt-x86_64-gcc
 
       - name: Add MinGW to PATH
         shell: pwsh
-        run: echo "C:\msys64\mingw64\bin" >> $env:GITHUB_PATH
+        run: |
+          $bin = Join-Path '${{ steps.msys2.outputs.msys2-location }}' 'ucrt64\bin'
+          echo $bin >> $env:GITHUB_PATH
 
       - name: Check tag matches Cargo.toml
         shell: pwsh
@@ -49,9 +52,11 @@ jobs:
 
       - name: Build and package
         shell: pwsh
-        env:
-          RUSH_CC: C:\msys64\mingw64\bin\gcc.exe
-        run: ./scripts/package-windows.ps1
+        run: |
+          $gcc = Get-Command gcc -ErrorAction SilentlyContinue
+          if (-not $gcc) { throw "gcc was not found on PATH" }
+          $env:RUSH_CC = $gcc.Source
+          ./scripts/package-windows.ps1
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
